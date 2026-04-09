@@ -1,0 +1,19 @@
+{
+  "name": "clover",
+  "version": "0.1.0",
+  "description": "Clover security review — automatically analyzes plans for security requirements before implementation",
+  "author": {
+    "name": "Clover Security"
+  },
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "server_url": {
+      "description": "Clover server URL (e.g. https://clover.yourcompany.com)",
+      "sensitive": false
+    },
+    "api_token": {
+      "description": "Clover API token for authentication",
+      "sensitive": true
+    }
+  }
+}

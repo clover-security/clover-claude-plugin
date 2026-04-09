@@ -1,0 +1,41 @@
+name: Validate
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate plugin.json
+        run: |
+          echo "Checking plugin.json..."
+          jq empty .claude-plugin/plugin.json
+          NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          VERSION=$(jq -r '.version' .claude-plugin/plugin.json)
+          echo "Plugin: $NAME v$VERSION"
+          [ -n "$NAME" ] && [ -n "$VERSION" ] && echo "Valid" || exit 1
+
+      - name: Validate hooks.json
+        run: |
+          echo "Checking hooks.json..."
+          jq empty hooks/hooks.json
+          echo "Valid"
+
+      - name: Check scripts are executable
+        run: |
+          for f in scripts/*.sh; do
+            if [ ! -x "$f" ]; then
+              echo "ERROR: $f is not executable"
+              exit 1
+            fi
+            echo "OK: $f"
+          done
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get install -y shellcheck > /dev/null 2>&1
+          shellcheck scripts/*.sh || true
