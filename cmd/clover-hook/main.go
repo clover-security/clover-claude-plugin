@@ -116,6 +116,7 @@ type reviewRequest struct {
 	Repo      string `json:"repo"`
 	Branch    string `json:"branch"`
 	User      string `json:"user"`
+	Email     string `json:"email"`
 	SessionID string `json:"session_id"`
 }
 
@@ -127,6 +128,7 @@ type reviewResponse struct {
 type logPromptRequest struct {
 	Prompt string `json:"prompt"`
 	User   string `json:"user"`
+	Email  string `json:"email"`
 	Repo   string `json:"repo"`
 	Branch string `json:"branch"`
 }
@@ -154,6 +156,21 @@ func getEnv(keys ...string) string {
 		if v := os.Getenv(k); v != "" {
 			return v
 		}
+	}
+	return ""
+}
+
+func getClaudeEmail() string {
+	cmd := exec.Command("claude", "auth", "status", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	var result struct {
+		Email string `json:"email"`
+	}
+	if json.Unmarshal(out, &result) == nil {
+		return result.Email
 	}
 	return ""
 }
@@ -247,6 +264,7 @@ func handleReviewPlan(input []byte) {
 		Repo:      filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
 		Branch:    gitCmd(cwd, "branch", "--show-current"),
 		User:      gitCmd(cwd, "config", "user.name"),
+		Email:     getClaudeEmail(),
 		SessionID: hook.SessionID,
 	}
 
@@ -301,6 +319,7 @@ func handleLogPrompt(input []byte) {
 	body := logPromptRequest{
 		Prompt: prompt,
 		User:   gitCmd(cwd, "config", "user.name"),
+		Email:  getClaudeEmail(),
 		Repo:   filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
 		Branch: gitCmd(cwd, "branch", "--show-current"),
 	}
