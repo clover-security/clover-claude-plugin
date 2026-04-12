@@ -43,7 +43,7 @@ type tokenResponse struct {
 }
 
 func getAuthURL() string {
-	serverURL := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
+	serverURL := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL")
 	if serverURL == "" {
 		return "https://app.cloversec.io"
 	}
@@ -58,8 +58,8 @@ func getAccessToken() (string, error) {
 		return cachedToken.token, nil
 	}
 
-	clientID := getEnv("CLOVER_CLIENT_ID", "USER_CONFIG_client_id")
-	clientSecret := getEnv("CLOVER_CLIENT_SECRET", "USER_CONFIG_client_secret")
+	clientID := getEnv("CLOVER_CLIENT_ID", "CLAUDE_PLUGIN_OPTION_CLIENT_ID")
+	clientSecret := getEnv("CLOVER_CLIENT_SECRET", "CLAUDE_PLUGIN_OPTION_CLIENT_SECRET")
 
 	if clientID == "" || clientSecret == "" {
 		return "", fmt.Errorf("missing client_id or client_secret")
@@ -201,7 +201,7 @@ func postJSON(url, token string, body interface{}) ([]byte, error) {
 }
 
 func getServerURL() string {
-	url := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
+	url := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL")
 	if url == "" {
 		return "https://app.cloversec.io"
 	}
@@ -278,8 +278,6 @@ func handleReviewPlan(input []byte) {
 }
 
 func handleLogPrompt(input []byte) {
-	logMsg("log-prompt called")
-
 	token, err := getAccessToken()
 	if err != nil {
 		logMsg(fmt.Sprintf("log-prompt: auth failed: %v", err))
