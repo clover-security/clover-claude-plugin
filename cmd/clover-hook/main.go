@@ -278,8 +278,11 @@ func handleReviewPlan(input []byte) {
 }
 
 func handleLogPrompt(input []byte) {
+	logMsg("log-prompt called")
+
 	token, err := getAccessToken()
 	if err != nil {
+		logMsg(fmt.Sprintf("log-prompt: auth failed: %v", err))
 		return
 	}
 
@@ -287,6 +290,7 @@ func handleLogPrompt(input []byte) {
 
 	var raw map[string]interface{}
 	if err := json.Unmarshal(input, &raw); err != nil {
+		logMsg(fmt.Sprintf("log-prompt: parse error: %v", err))
 		return
 	}
 
@@ -295,14 +299,19 @@ func handleLogPrompt(input []byte) {
 		cwd = "."
 	}
 
+	prompt := fmt.Sprintf("%v", raw["prompt"])
 	body := logPromptRequest{
-		Prompt: fmt.Sprintf("%v", raw["prompt"]),
+		Prompt: prompt,
 		User:   gitCmd(cwd, "config", "user.name"),
 		Repo:   filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
 		Branch: gitCmd(cwd, "branch", "--show-current"),
 	}
 
-	postJSON(serverURL+"/Hooks/LogPrompt", token, body)
+	logMsg(fmt.Sprintf("log-prompt: %dchars → %s", len(prompt), serverURL))
+	_, err = postJSON(serverURL+"/Hooks/LogPrompt", token, body)
+	if err != nil {
+		logMsg(fmt.Sprintf("log-prompt: POST failed: %v", err))
+	}
 }
 
 func main() {
