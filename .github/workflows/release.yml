@@ -8,12 +8,48 @@ permissions:
   contents: write
 
 jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            name: clover-hook-darwin-arm64
+          - goos: darwin
+            goarch: amd64
+            name: clover-hook-darwin-amd64
+          - goos: linux
+            goarch: amd64
+            name: clover-hook-linux-amd64
+          - goos: linux
+            goarch: arm64
+            name: clover-hook-linux-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Build
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags="-s -w" -o ${{ matrix.name }} ./cmd/clover-hook/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Get current version
         id: current
@@ -40,9 +76,7 @@ jobs:
             echo "type=patch" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-
           if echo "$COMMITS" | grep -qiE "^(BREAKING CHANGE|feat!|fix!)"; then
             echo "type=major" >> "$GITHUB_OUTPUT"
           elif echo "$COMMITS" | grep -qiE "^feat"; then
@@ -57,30 +91,24 @@ jobs:
         run: |
           VERSION="${{ steps.current.outputs.version }}"
           BUMP="${{ steps.bump.outputs.type }}"
-
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-
           case "$BUMP" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
           esac
-
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-
-          # Update plugin.json
           jq --arg v "$NEW_VERSION" '.version = $v' .claude-plugin/plugin.json > tmp.json
           mv tmp.json .claude-plugin/plugin.json
 
       - name: Commit version bump
         if: steps.check.outputs.exists == 'true'
         run: |
-          NEW_VERSION="${{ steps.next.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .claude-plugin/plugin.json
-          git commit -m "chore: bump version to $NEW_VERSION"
+          git commit -m "chore: bump version to ${{ steps.next.outputs.version }}"
           git push
 
       - name: Resolve final version
@@ -92,14 +120,23 @@ jobs:
             echo "version=${{ steps.current.outputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Prepare binaries
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            cp "$dir/$name" "release/$name"
+            chmod +x "release/$name"
+          done
+
       - name: Create tag and release
         run: |
           VERSION="${{ steps.final.outputs.version }}"
           git tag "v$VERSION"
           git push origin "v$VERSION"
-
           gh release create "v$VERSION" \
             --title "v$VERSION" \
-            --generate-notes
+            --generate-notes \
+            release/*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

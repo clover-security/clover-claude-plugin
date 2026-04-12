@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/review-plan.sh",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/clover-hook review-plan",
             "timeout": 300
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/log-prompt.sh"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/clover-hook log-prompt"
           }
         ]
       }
