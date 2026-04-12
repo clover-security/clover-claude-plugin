@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -28,18 +27,15 @@ func logMsg(msg string) {
 
 // --- Auth: token exchange + caching ---
 
-type tokenCache struct {
-	mu        sync.Mutex
-	token     string
-	expiresAt time.Time
-}
-
-var cachedToken tokenCache
-
 type tokenResponse struct {
 	AccessToken string `json:"accessToken"`
 	ExpiresIn   int    `json:"expiresIn"`
 	TokenType   string `json:"tokenType"`
+}
+
+type cachedTokenFile struct {
+	Token     string `json:"token"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 func getAuthURL() string {
@@ -50,12 +46,41 @@ func getAuthURL() string {
 	return strings.TrimRight(authURL, "/")
 }
 
-func getAccessToken() (string, error) {
-	cachedToken.mu.Lock()
-	defer cachedToken.mu.Unlock()
+func tokenCachePath() string {
+	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
+	if dataDir == "" {
+		return "/tmp/clover-token.json"
+	}
+	return filepath.Join(dataDir, "token.json")
+}
 
-	if cachedToken.token != "" && time.Now().Before(cachedToken.expiresAt) {
-		return cachedToken.token, nil
+func loadCachedToken() (string, bool) {
+	data, err := os.ReadFile(tokenCachePath())
+	if err != nil {
+		return "", false
+	}
+	var cached cachedTokenFile
+	if json.Unmarshal(data, &cached) != nil {
+		return "", false
+	}
+	if time.Now().Unix() >= cached.ExpiresAt {
+		return "", false
+	}
+	return cached.Token, true
+}
+
+func saveCachedToken(token string, expiresIn int) {
+	cached := cachedTokenFile{
+		Token:     token,
+		ExpiresAt: time.Now().Add(time.Duration(expiresIn-60) * time.Second).Unix(),
+	}
+	data, _ := json.Marshal(cached)
+	os.WriteFile(tokenCachePath(), data, 0600)
+}
+
+func getAccessToken() (string, error) {
+	if token, ok := loadCachedToken(); ok {
+		return token, nil
 	}
 
 	clientID := getEnv("CLOVER_CLIENT_ID", "CLAUDE_PLUGIN_OPTION_CLIENT_ID")
@@ -88,11 +113,10 @@ func getAccessToken() (string, error) {
 		return "", fmt.Errorf("auth response parse error: %w", err)
 	}
 
-	cachedToken.token = tokenResp.AccessToken
-	cachedToken.expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60) * time.Second)
+	saveCachedToken(tokenResp.AccessToken, tokenResp.ExpiresIn)
 
 	logMsg(fmt.Sprintf("token acquired, expires in %ds", tokenResp.ExpiresIn))
-	return cachedToken.token, nil
+	return tokenResp.AccessToken, nil
 }
 
 // --- Models ---
