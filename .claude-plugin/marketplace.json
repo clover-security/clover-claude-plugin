@@ -1,0 +1,15 @@
+{
+  "name": "clover-security",
+  "owner": {
+    "name": "Clover Security",
+    "email": "security@clover.com"
+  },
+  "plugins": [
+    {
+      "name": "clover",
+      "source": ".",
+      "description": "Automatically reviews plans for security requirements before implementation",
+      "version": "0.1.0"
+    }
+  ]
+}
