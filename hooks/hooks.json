@@ -1,12 +1,22 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "ExitPlanMode",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/clover-hook review-plan",
+            "command": "${CLAUDE_PLUGIN_DATA}/bin/clover-hook review-plan",
             "timeout": 300
           }
         ]
@@ -17,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/clover-hook log-prompt"
+            "command": "${CLAUDE_PLUGIN_DATA}/bin/clover-hook log-prompt"
           }
         ]
       }
