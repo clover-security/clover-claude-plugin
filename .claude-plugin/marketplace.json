@@ -8,8 +8,8 @@
     {
       "name": "clover",
       "source": {
-        "source": "github",
-        "repo": "clover-security/clover-claude-plugin"
+        "source": "url",
+        "url": "https://github.com/clover-security/clover-claude-plugin.git"
       },
       "description": "Automatically reviews plans for security requirements before implementation",
       "version": "0.1.10"
