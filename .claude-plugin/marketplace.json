@@ -12,7 +12,7 @@
         "repo": "clover-security/clover-claude-plugin"
       },
       "description": "Automatically reviews plans for security requirements before implementation",
-      "version": "0.1.0"
+      "version": "0.5.0"
     }
   ]
 }
