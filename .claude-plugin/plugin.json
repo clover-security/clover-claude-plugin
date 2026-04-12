@@ -5,7 +5,6 @@
   "author": {
     "name": "Clover Security"
   },
-  "hooks": "./hooks/hooks.json",
   "userConfig": {
     "server_url": {
       "title": "Clover Server URL",
