@@ -8,11 +8,15 @@
   "hooks": "./hooks/hooks.json",
   "userConfig": {
     "server_url": {
-      "description": "Clover server URL (e.g. https://clover.yourcompany.com)",
+      "description": "Clover server URL (e.g. https://app.cloversec.io)",
       "sensitive": false
     },
-    "api_token": {
-      "description": "Clover API token for authentication",
+    "client_id": {
+      "description": "Clover API client ID (from Settings > API Tokens)",
+      "sensitive": false
+    },
+    "client_secret": {
+      "description": "Clover API client secret",
       "sensitive": true
     }
   }

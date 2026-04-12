@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,13 +26,83 @@ func logMsg(msg string) {
 	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
-// hookInput is the JSON structure Claude Code sends on stdin.
+// --- Auth: token exchange + caching ---
+
+type tokenCache struct {
+	mu        sync.Mutex
+	token     string
+	expiresAt time.Time
+}
+
+var cachedToken tokenCache
+
+type tokenResponse struct {
+	AccessToken string `json:"accessToken"`
+	ExpiresIn   int    `json:"expiresIn"`
+	TokenType   string `json:"tokenType"`
+}
+
+func getAuthURL() string {
+	serverURL := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
+	if serverURL == "" {
+		return "https://app.cloversec.io"
+	}
+	return strings.TrimRight(serverURL, "/")
+}
+
+func getAccessToken() (string, error) {
+	cachedToken.mu.Lock()
+	defer cachedToken.mu.Unlock()
+
+	if cachedToken.token != "" && time.Now().Before(cachedToken.expiresAt) {
+		return cachedToken.token, nil
+	}
+
+	clientID := getEnv("CLOVER_CLIENT_ID", "USER_CONFIG_client_id")
+	clientSecret := getEnv("CLOVER_CLIENT_SECRET", "USER_CONFIG_client_secret")
+
+	if clientID == "" || clientSecret == "" {
+		return "", fmt.Errorf("missing client_id or client_secret")
+	}
+
+	authURL := getAuthURL() + "/identity/resources/auth/v1/api-token"
+
+	body, _ := json.Marshal(map[string]string{
+		"clientId": clientID,
+		"secret":   clientSecret,
+	})
+
+	resp, err := httpClient().Post(authURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("auth request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("auth returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var tokenResp tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("auth response parse error: %w", err)
+	}
+
+	cachedToken.token = tokenResp.AccessToken
+	cachedToken.expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60) * time.Second)
+
+	logMsg(fmt.Sprintf("token acquired, expires in %ds", tokenResp.ExpiresIn))
+	return cachedToken.token, nil
+}
+
+// --- Models ---
+
 type hookInput struct {
-	SessionID  string    `json:"session_id"`
-	CWD        string    `json:"cwd"`
-	HookEvent  string    `json:"hook_event_name"`
-	ToolName   string    `json:"tool_name"`
-	ToolInput  toolInput `json:"tool_input"`
+	SessionID string    `json:"session_id"`
+	CWD       string    `json:"cwd"`
+	HookEvent string    `json:"hook_event_name"`
+	ToolName  string    `json:"tool_name"`
+	ToolInput toolInput `json:"tool_input"`
 }
 
 type toolInput struct {
@@ -39,7 +110,6 @@ type toolInput struct {
 	PlanFilePath string `json:"planFilePath"`
 }
 
-// reviewRequest is sent to the Clover server.
 type reviewRequest struct {
 	Plan      string `json:"plan"`
 	PlanFile  string `json:"plan_file"`
@@ -49,19 +119,19 @@ type reviewRequest struct {
 	SessionID string `json:"session_id"`
 }
 
-// reviewResponse is returned by the Clover server.
 type reviewResponse struct {
 	Approved bool   `json:"approved"`
 	Reason   string `json:"reason"`
 }
 
-// logPromptRequest is sent for prompt logging.
 type logPromptRequest struct {
 	Prompt string `json:"prompt"`
 	User   string `json:"user"`
 	Repo   string `json:"repo"`
 	Branch string `json:"branch"`
 }
+
+// --- Helpers ---
 
 func allowJSON() string {
 	return `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
@@ -130,6 +200,16 @@ func postJSON(url, token string, body interface{}) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+func getServerURL() string {
+	url := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
+	if url == "" {
+		return "https://app.cloversec.io"
+	}
+	return strings.TrimRight(url, "/")
+}
+
+// --- Handlers ---
+
 func handleReviewPlan(input []byte) {
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
@@ -147,11 +227,14 @@ func handleReviewPlan(input []byte) {
 		return
 	}
 
-	serverURL := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
-	if serverURL == "" {
-		serverURL = "http://localhost:8000"
+	token, err := getAccessToken()
+	if err != nil {
+		logMsg(fmt.Sprintf("allow (auth failed: %v)", err))
+		fmt.Println(allowJSON())
+		return
 	}
-	apiToken := getEnv("CLOVER_API_TOKEN", "USER_CONFIG_api_token")
+
+	serverURL := getServerURL()
 
 	cwd := hook.CWD
 	if cwd == "" {
@@ -168,7 +251,7 @@ func handleReviewPlan(input []byte) {
 	}
 
 	start := time.Now()
-	respBody, err := postJSON(serverURL+"/hooks/review-plan", apiToken, body)
+	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, body)
 	elapsed := time.Since(start).Seconds()
 
 	if err != nil {
@@ -195,13 +278,13 @@ func handleReviewPlan(input []byte) {
 }
 
 func handleLogPrompt(input []byte) {
-	serverURL := getEnv("CLOVER_SERVER_URL", "USER_CONFIG_server_url")
-	if serverURL == "" {
-		serverURL = "http://localhost:8000"
+	token, err := getAccessToken()
+	if err != nil {
+		return
 	}
-	apiToken := getEnv("CLOVER_API_TOKEN", "USER_CONFIG_api_token")
 
-	// Parse the raw input to get prompt field, merge with git metadata
+	serverURL := getServerURL()
+
 	var raw map[string]interface{}
 	if err := json.Unmarshal(input, &raw); err != nil {
 		return
@@ -219,8 +302,7 @@ func handleLogPrompt(input []byte) {
 		Branch: gitCmd(cwd, "branch", "--show-current"),
 	}
 
-	// Fire and forget — don't block the prompt
-	postJSON(serverURL+"/hooks/log-prompt", apiToken, body)
+	postJSON(serverURL+"/Hooks/LogPrompt", token, body)
 }
 
 func main() {
