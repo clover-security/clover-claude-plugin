@@ -43,11 +43,11 @@ type tokenResponse struct {
 }
 
 func getAuthURL() string {
-	serverURL := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL")
-	if serverURL == "" {
-		return "https://app.cloversec.io"
+	authURL := getEnv("CLOVER_AUTH_URL", "CLAUDE_PLUGIN_OPTION_AUTH_URL")
+	if authURL == "" {
+		return "https://clover.frontegg.com"
 	}
-	return strings.TrimRight(serverURL, "/")
+	return strings.TrimRight(authURL, "/")
 }
 
 func getAccessToken() (string, error) {
