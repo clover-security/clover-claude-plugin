@@ -141,7 +141,7 @@ type reviewRequest struct {
 	Branch    string `json:"branch"`
 	User      string `json:"user"`
 	Email     string `json:"email"`
-	SessionID string `json:"session_id"`
+	SessionID string `json:"sessionId"`
 }
 
 type reviewResponse struct {
