@@ -320,6 +320,13 @@ func handleReviewPlan(input []byte) {
 }
 
 func handleLogPrompt(input []byte) {
+	// Debug: dump CLAUDE_PLUGIN env vars
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "CLAUDE_PLUGIN") {
+			logMsg(fmt.Sprintf("env: %s", env))
+		}
+	}
+
 	token, err := getAccessToken()
 	if err != nil {
 		logMsg(fmt.Sprintf("log-prompt: auth failed: %v", err))

@@ -28,7 +28,7 @@
       "title": "Client Secret",
       "description": "API client secret",
       "type": "string",
-      "sensitive": true
+      "sensitive": false
     }
   }
 }
