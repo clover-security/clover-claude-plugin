@@ -144,9 +144,15 @@ type reviewRequest struct {
 	SessionID string `json:"sessionId"`
 }
 
+type pollRequest struct {
+	SessionID string `json:"sessionId"`
+	TaskID    string `json:"taskId"`
+}
+
 type reviewResponse struct {
 	Approved bool   `json:"approved"`
 	Reason   string `json:"reason"`
+	TaskID   string `json:"taskId"`
 }
 
 type logPromptRequest struct {
@@ -238,7 +244,14 @@ func postJSON(url, token string, body interface{}) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	body2, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body2))
+	}
+	return body2, nil
 }
 
 func getServerURL() string {
@@ -282,7 +295,7 @@ func handleReviewPlan(input []byte) {
 		cwd = "."
 	}
 
-	body := reviewRequest{
+	base := reviewRequest{
 		Plan:      plan,
 		PlanFile:  hook.ToolInput.PlanFilePath,
 		Repo:      filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
@@ -292,10 +305,14 @@ func handleReviewPlan(input []byte) {
 		SessionID: hook.SessionID,
 	}
 
-	start := time.Now()
-	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, body)
-	elapsed := time.Since(start).Seconds()
+	const pollInterval = 3 * time.Second
+	const maxPolls = 80
 
+	start := time.Now()
+
+	// Start the review
+	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, base)
+	elapsed := time.Since(start).Seconds()
 	if err != nil {
 		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", elapsed, err))
 		fmt.Println(allowJSON())
@@ -309,8 +326,33 @@ func handleReviewPlan(input []byte) {
 		return
 	}
 
-	logMsg(fmt.Sprintf("result: approved=%v %.0fs", resp.Approved, elapsed))
+	// Poll until done
+	for poll := 0; resp.TaskID != ""; poll++ {
+		if poll >= maxPolls {
+			logMsg(fmt.Sprintf("allow (poll timeout after %d attempts %.0fs)", poll, elapsed))
+			fmt.Println(allowJSON())
+			return
+		}
+		logMsg(fmt.Sprintf("pending task=%s poll=%d %.0fs", resp.TaskID, poll, elapsed))
+		time.Sleep(pollInterval)
 
+		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
+		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
+		elapsed = time.Since(start).Seconds()
+		if err != nil {
+			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", elapsed, err))
+			fmt.Println(allowJSON())
+			return
+		}
+		resp = reviewResponse{}
+		if err := json.Unmarshal(respBody, &resp); err != nil {
+			logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+			fmt.Println(allowJSON())
+			return
+		}
+	}
+
+	logMsg(fmt.Sprintf("result: approved=%v %.0fs", resp.Approved, elapsed))
 	if resp.Approved {
 		fmt.Println(allowJSON())
 	} else {
