@@ -1,3 +1,61 @@
+// Package main implements the clover-hook binary — a Claude Code plugin hook
+// that intercepts plan-mode exits and runs a server-side security review before
+// allowing the agent to proceed.
+//
+// # How it works
+//
+// Claude Code calls this binary at two points during a session:
+//
+//  1. PreToolUse on ExitPlanMode — the agent is about to leave plan mode and
+//     start implementing. The hook sends the plan to the Clover server for a
+//     security review. If the server finds unaddressed MUST requirements, the
+//     hook returns "deny" and Claude Code blocks the action, showing the
+//     developer the missing security items.
+//
+//  2. UserPromptSubmit — the user submitted a prompt. The hook forwards it to
+//     the server for audit logging (fire-and-forget, never blocks).
+//
+// # Review flow
+//
+// Because security analysis can take 20–30 seconds (entity resolution, LLM
+// calls), the review uses an async pattern:
+//
+//  POST /Hooks/ReviewPlan  { plan, repo, branch, sessionId }
+//       → { taskId }                       (analysis queued, poll for result)
+//
+//  POST /Hooks/PollReview  { sessionId, taskId }
+//       → { taskId }                       (still processing, wait and retry)
+//       → { approved, reason }             (final verdict)
+//
+// If the server is unreachable or the review times out, the hook always
+// approves — it never blocks work due to infrastructure issues.
+//
+// # Session model
+//
+// The server tracks a session (keyed by Claude Code's session_id) across
+// multiple plan reviews. The first review fetches and classifies security
+// requirements; subsequent reviews in the same session only judge whether the
+// updated plan addresses the previously identified MUST requirements. After
+// 4 reviews or a passing verdict the session is cleared.
+//
+// # Configuration
+//
+// The binary is configured via environment variables, typically set by the
+// Claude Code plugin framework:
+//
+//	CLOVER_CLIENT_ID / CLAUDE_PLUGIN_OPTION_CLIENT_ID       — Frontegg API client ID
+//	CLOVER_CLIENT_SECRET / CLAUDE_PLUGIN_OPTION_CLIENT_SECRET — Frontegg API secret
+//	CLOVER_SERVER_URL / CLAUDE_PLUGIN_OPTION_SERVER_URL     — Clover API base URL (default: https://app.cloversec.io)
+//	CLOVER_AUTH_URL / CLAUDE_PLUGIN_OPTION_AUTH_URL         — Frontegg auth URL (default: https://clover.frontegg.com)
+//	CLAUDE_PLUGIN_DATA                                       — directory for caching the auth token
+//
+// # Debugging
+//
+// All activity is appended to /tmp/clover-hook.log with timestamps.
+// To force a fresh auth token, delete the cached token file:
+//
+//	rm /tmp/clover-token.json            # default location
+//	rm $CLAUDE_PLUGIN_DATA/token.json    # if CLAUDE_PLUGIN_DATA is set
 package main
 
 import (
@@ -14,8 +72,11 @@ import (
 	"time"
 )
 
+// logFile is the path where all hook activity is written for debugging.
 const logFile = "/tmp/clover-hook.log"
 
+// logMsg appends a timestamped message to the log file. Errors writing to the
+// log are silently ignored so the hook never fails due to logging issues.
 func logMsg(msg string) {
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -25,19 +86,25 @@ func logMsg(msg string) {
 	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
-// --- Auth: token exchange + caching ---
+// =============================================================================
+// Auth — Frontegg API token exchange and file-based caching
+// =============================================================================
 
+// tokenResponse is the JSON body returned by the Frontegg token endpoint.
 type tokenResponse struct {
 	AccessToken string `json:"accessToken"`
 	ExpiresIn   int    `json:"expiresIn"`
 	TokenType   string `json:"tokenType"`
 }
 
+// cachedTokenFile is the structure persisted to disk to avoid re-authenticating
+// on every hook invocation.
 type cachedTokenFile struct {
 	Token     string `json:"token"`
-	ExpiresAt int64  `json:"expires_at"`
+	ExpiresAt int64  `json:"expires_at"` // Unix timestamp; token is refreshed 60s early
 }
 
+// getAuthURL returns the Frontegg base URL, configurable via environment.
 func getAuthURL() string {
 	authURL := getEnv("CLOVER_AUTH_URL", "CLAUDE_PLUGIN_OPTION_AUTH_URL")
 	if authURL == "" {
@@ -46,6 +113,8 @@ func getAuthURL() string {
 	return strings.TrimRight(authURL, "/")
 }
 
+// tokenCachePath returns the path to the cached token file.
+// Defaults to /tmp/clover-token.json unless CLAUDE_PLUGIN_DATA is set.
 func tokenCachePath() string {
 	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
 	if dataDir == "" {
@@ -54,6 +123,8 @@ func tokenCachePath() string {
 	return filepath.Join(dataDir, "token.json")
 }
 
+// loadCachedToken reads the cached token from disk and returns it if it has
+// not expired. Returns ("", false) if the file is missing, invalid, or stale.
 func loadCachedToken() (string, bool) {
 	data, err := os.ReadFile(tokenCachePath())
 	if err != nil {
@@ -69,6 +140,8 @@ func loadCachedToken() (string, bool) {
 	return cached.Token, true
 }
 
+// saveCachedToken writes the token to disk with an expiry 60 seconds before
+// the server-reported expiry to avoid using a token that is about to expire.
 func saveCachedToken(token string, expiresIn int) {
 	cached := cachedTokenFile{
 		Token:     token,
@@ -78,6 +151,9 @@ func saveCachedToken(token string, expiresIn int) {
 	os.WriteFile(tokenCachePath(), data, 0600)
 }
 
+// getAccessToken returns a valid Frontegg API token, using the disk cache when
+// possible. On cache miss it exchanges the client credentials for a new token
+// and saves it. Returns an error if credentials are missing or auth fails.
 func getAccessToken() (string, error) {
 	if token, ok := loadCachedToken(); ok {
 		return token, nil
@@ -119,42 +195,58 @@ func getAccessToken() (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
-// --- Models ---
+// =============================================================================
+// Request / response models
+// =============================================================================
 
+// hookInput is the JSON payload Claude Code sends to the hook binary on stdin.
 type hookInput struct {
-	SessionID string    `json:"session_id"`
-	CWD       string    `json:"cwd"`
+	SessionID string    `json:"session_id"`  // unique ID for this Claude Code session
+	CWD       string    `json:"cwd"`         // working directory of the Claude Code process
 	HookEvent string    `json:"hook_event_name"`
 	ToolName  string    `json:"tool_name"`
 	ToolInput toolInput `json:"tool_input"`
 }
 
+// toolInput carries the plan text written by the agent when exiting plan mode.
 type toolInput struct {
 	Plan         string `json:"plan"`
 	PlanFilePath string `json:"planFilePath"`
 }
 
+// reviewRequest is sent to POST /Hooks/ReviewPlan to start a security review.
+// Only sent once per review attempt — subsequent status checks use pollRequest.
 type reviewRequest struct {
-	Plan      string `json:"plan"`
-	PlanFile  string `json:"plan_file"`
-	Repo      string `json:"repo"`
-	Branch    string `json:"branch"`
-	User      string `json:"user"`
-	Email     string `json:"email"`
-	SessionID string `json:"sessionId"`
+	Plan      string `json:"plan"`       // full plan text
+	PlanFile  string `json:"plan_file"`  // path to plan file, if any
+	Repo      string `json:"repo"`       // git repository name
+	Branch    string `json:"branch"`     // current git branch
+	User      string `json:"user"`       // git user.name
+	Email     string `json:"email"`      // Claude Code authenticated user email
+	SessionID string `json:"sessionId"`  // Claude Code session ID
 }
 
+// pollRequest is sent to POST /Hooks/PollReview to check whether a previously
+// queued review has completed. Much smaller than reviewRequest — no plan text.
 type pollRequest struct {
 	SessionID string `json:"sessionId"`
 	TaskID    string `json:"taskId"`
 }
 
+// reviewResponse is returned by both /Hooks/ReviewPlan and /Hooks/PollReview.
+//
+//   - TaskID non-empty → analysis is still running; poll again after a short wait.
+//   - TaskID empty, Approved true → plan passed security review; proceed.
+//   - TaskID empty, Approved false → plan has unaddressed MUST requirements;
+//     Reason contains a human-readable list to show the developer.
 type reviewResponse struct {
 	Approved bool   `json:"approved"`
 	Reason   string `json:"reason"`
 	TaskID   string `json:"taskId"`
 }
 
+// logPromptRequest is sent to POST /Hooks/LogPrompt for audit purposes.
+// This call is fire-and-forget and never blocks the user.
 type logPromptRequest struct {
 	Prompt string `json:"prompt"`
 	User   string `json:"user"`
@@ -163,12 +255,17 @@ type logPromptRequest struct {
 	Branch string `json:"branch"`
 }
 
-// --- Helpers ---
+// =============================================================================
+// Claude Code hook output helpers
+// =============================================================================
 
+// allowJSON returns the JSON payload that tells Claude Code to allow the action.
 func allowJSON() string {
 	return `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
 }
 
+// denyJSON returns the JSON payload that tells Claude Code to block the action
+// and display reason to the developer.
 func denyJSON(reason string) string {
 	output := map[string]interface{}{
 		"hookSpecificOutput": map[string]interface{}{
@@ -181,6 +278,12 @@ func denyJSON(reason string) string {
 	return string(b)
 }
 
+// =============================================================================
+// Utility helpers
+// =============================================================================
+
+// getEnv returns the value of the first environment variable in keys that is
+// non-empty, or "" if none are set. Supports fallback keys for compatibility.
 func getEnv(keys ...string) string {
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
@@ -190,6 +293,8 @@ func getEnv(keys ...string) string {
 	return ""
 }
 
+// getClaudeEmail returns the email of the Claude Code authenticated user by
+// running `claude auth status --json`. Returns "" if the command fails.
 func getClaudeEmail() string {
 	cmd := exec.Command("claude", "auth", "status", "--json")
 	out, err := cmd.Output()
@@ -205,6 +310,8 @@ func getClaudeEmail() string {
 	return ""
 }
 
+// gitCmd runs a git command in the given directory and returns trimmed stdout.
+// Returns "unknown" if the command fails.
 func gitCmd(dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -215,6 +322,8 @@ func gitCmd(dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// httpClient returns an HTTP client with a 5-minute timeout. TLS verification
+// is disabled to support self-signed certs in local/staging environments.
 func httpClient() *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Minute,
@@ -224,6 +333,8 @@ func httpClient() *http.Client {
 	}
 }
 
+// postJSON marshals body as JSON, POSTs it to url with a Bearer token header,
+// and returns the response body. Returns an error for non-2xx status codes.
 func postJSON(url, token string, body interface{}) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -254,6 +365,7 @@ func postJSON(url, token string, body interface{}) ([]byte, error) {
 	return body2, nil
 }
 
+// getServerURL returns the Clover API base URL, configurable via environment.
 func getServerURL() string {
 	url := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL")
 	if url == "" {
@@ -262,8 +374,18 @@ func getServerURL() string {
 	return strings.TrimRight(url, "/")
 }
 
-// --- Handlers ---
+// =============================================================================
+// Hook handlers
+// =============================================================================
 
+// handleReviewPlan is called when Claude Code fires the PreToolUse hook on
+// ExitPlanMode. It sends the plan to the Clover server for security review and
+// writes an allow or deny decision to stdout.
+//
+// The review is async: the first call returns a taskId; subsequent calls to
+// /Hooks/PollReview check progress until a final verdict is returned. The hook
+// always allows if the server is unreachable or times out — it is a best-effort
+// security gate and must never block legitimate work due to infrastructure issues.
 func handleReviewPlan(input []byte) {
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
@@ -306,11 +428,11 @@ func handleReviewPlan(input []byte) {
 	}
 
 	const pollInterval = 3 * time.Second
-	const maxPolls = 80
+	const maxPolls = 80 // 80 × 3s = 4 minutes max wait
 
 	start := time.Now()
 
-	// Start the review
+	// Start the review — sends the full plan once.
 	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, base)
 	elapsed := time.Since(start).Seconds()
 	if err != nil {
@@ -326,7 +448,8 @@ func handleReviewPlan(input []byte) {
 		return
 	}
 
-	// Poll until done
+	// Poll until the server returns a final verdict (TaskID becomes empty).
+	// Only sessionId + taskId are sent — no need to resend the full plan.
 	for poll := 0; resp.TaskID != ""; poll++ {
 		if poll >= maxPolls {
 			logMsg(fmt.Sprintf("allow (poll timeout after %d attempts %.0fs)", poll, elapsed))
@@ -361,8 +484,11 @@ func handleReviewPlan(input []byte) {
 	}
 }
 
+// handleLogPrompt is called when Claude Code fires the UserPromptSubmit hook.
+// It forwards the prompt to the Clover server for audit logging. This call is
+// fire-and-forget — failures are logged but never surface to the developer.
 func handleLogPrompt(input []byte) {
-	// Debug: dump CLAUDE_PLUGIN env vars
+	// Log all CLAUDE_PLUGIN_* env vars at debug level to help with configuration issues.
 	for _, env := range os.Environ() {
 		if strings.HasPrefix(env, "CLAUDE_PLUGIN") {
 			logMsg(fmt.Sprintf("env: %s", env))
@@ -404,6 +530,15 @@ func handleLogPrompt(input []byte) {
 	}
 }
 
+// =============================================================================
+// Entry point
+// =============================================================================
+
+// main reads the hook event from stdin and dispatches to the appropriate
+// handler based on the command-line argument:
+//
+//	clover-hook review-plan   — called on ExitPlanMode (PreToolUse)
+//	clover-hook log-prompt    — called on UserPromptSubmit
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: clover-hook <review-plan|log-prompt>")
