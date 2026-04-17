@@ -12,7 +12,7 @@
         "url": "https://github.com/clover-security/clover-claude-plugin.git"
       },
       "description": "Automatically reviews plans for security requirements before implementation",
-      "version": "0.1.16"
+      "version": "0.1.17"
     }
   ]
 }
