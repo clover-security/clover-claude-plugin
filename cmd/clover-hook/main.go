@@ -383,9 +383,11 @@ func getServerURL() string {
 // writes an allow or deny decision to stdout.
 //
 // The review is async: the first call returns a taskId; subsequent calls to
-// /Hooks/PollReview check progress until a final verdict is returned. The hook
-// always allows if the server is unreachable or times out — it is a best-effort
-// security gate and must never block legitimate work due to infrastructure issues.
+// /Hooks/PollReview check progress until a final verdict is returned. Polling
+// runs for up to 4 minutes (time-based deadline). The pending counter only
+// increments on confirmed "still processing" responses from the server, not on
+// network errors. The hook always allows on timeout or unreachable server — it
+// is a best-effort gate and must never block work due to infrastructure issues.
 func handleReviewPlan(input []byte) {
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
@@ -428,15 +430,15 @@ func handleReviewPlan(input []byte) {
 	}
 
 	const pollInterval = 3 * time.Second
-	const maxPolls = 80 // 80 × 3s = 4 minutes max wait
+	const maxWait = 4 * time.Minute
 
 	start := time.Now()
+	deadline := start.Add(maxWait)
 
 	// Start the review — sends the full plan once.
 	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, base)
-	elapsed := time.Since(start).Seconds()
 	if err != nil {
-		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", elapsed, err))
+		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
 		fmt.Println(allowJSON())
 		return
 	}
@@ -449,21 +451,24 @@ func handleReviewPlan(input []byte) {
 	}
 
 	// Poll until the server returns a final verdict (TaskID becomes empty).
-	// Only sessionId + taskId are sent — no need to resend the full plan.
-	for poll := 0; resp.TaskID != ""; poll++ {
-		if poll >= maxPolls {
-			logMsg(fmt.Sprintf("allow (poll timeout after %d attempts %.0fs)", poll, elapsed))
+	// pendingCount tracks confirmed "still processing" responses from the server
+	// — it only increments when the server explicitly says the task is pending,
+	// not on network errors or retries. The hard limit is the time deadline.
+	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
+		elapsed := time.Since(start)
+		if time.Now().After(deadline) {
+			logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, elapsed.Seconds()))
 			fmt.Println(allowJSON())
 			return
 		}
-		logMsg(fmt.Sprintf("pending task=%s poll=%d %.0fs", resp.TaskID, poll, elapsed))
+		logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
+			resp.TaskID, pendingCount, elapsed.Seconds(), time.Until(deadline).Seconds()))
 		time.Sleep(pollInterval)
 
 		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
 		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
-		elapsed = time.Since(start).Seconds()
 		if err != nil {
-			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", elapsed, err))
+			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
 			fmt.Println(allowJSON())
 			return
 		}
@@ -475,7 +480,7 @@ func handleReviewPlan(input []byte) {
 		}
 	}
 
-	logMsg(fmt.Sprintf("result: approved=%v %.0fs", resp.Approved, elapsed))
+	logMsg(fmt.Sprintf("result: approved=%v %.0fs", resp.Approved, time.Since(start).Seconds()))
 	if resp.Approved {
 		fmt.Println(allowJSON())
 	} else {
