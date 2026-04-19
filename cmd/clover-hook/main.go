@@ -214,16 +214,27 @@ type toolInput struct {
 	PlanFilePath string `json:"planFilePath"`
 }
 
-// reviewRequest is sent to POST /Hooks/ReviewPlan to start a security review.
-// Only sent once per review attempt — subsequent status checks use pollRequest.
+// sessionState holds classified security requirements returned by the server
+// after analysis completes. The plugin stores it and echoes it back on every
+// subsequent ReviewPlan call so the server can remain stateless.
+type sessionState struct {
+	Must        []string `json:"must"`
+	Optional    []string `json:"optional,omitempty"`
+	ReviewCount int      `json:"reviewCount"`
+}
+
+// reviewRequest is sent to POST /Hooks/ReviewPlan to start or continue a review.
+// SessionState is omitted on the first call; the server returns it after analysis
+// and the plugin includes it on all subsequent calls.
 type reviewRequest struct {
-	Plan      string `json:"plan"`       // full plan text
-	PlanFile  string `json:"plan_file"`  // path to plan file, if any
-	Repo      string `json:"repo"`       // git repository name
-	Branch    string `json:"branch"`     // current git branch
-	User      string `json:"user"`       // git user.name
-	Email     string `json:"email"`      // Claude Code authenticated user email
-	SessionID string `json:"sessionId"`  // Claude Code session ID
+	Plan         string        `json:"plan"`                   // full plan text
+	PlanFile     string        `json:"plan_file"`              // path to plan file, if any
+	Repo         string        `json:"repo"`                   // git repository name
+	Branch       string        `json:"branch"`                 // current git branch
+	User         string        `json:"user"`                   // git user.name
+	Email        string        `json:"email"`                  // Claude Code authenticated user email
+	SessionID    string        `json:"sessionId"`              // Claude Code session ID
+	SessionState *sessionState `json:"sessionState,omitempty"` // echoed from previous response
 }
 
 // pollRequest is sent to POST /Hooks/PollReview to check whether a previously
@@ -239,10 +250,12 @@ type pollRequest struct {
 //   - TaskID empty, Approved true → plan passed security review; proceed.
 //   - TaskID empty, Approved false → plan has unaddressed MUST requirements;
 //     Reason contains a human-readable list to show the developer.
+//   - SessionState non-nil → store and echo back on the next ReviewPlan call.
 type reviewResponse struct {
-	Approved bool   `json:"approved"`
-	Reason   string `json:"reason"`
-	TaskID   string `json:"taskId"`
+	Approved     bool          `json:"approved"`
+	Reason       string        `json:"reason"`
+	SessionState *sessionState `json:"sessionState,omitempty"`
+	TaskID       string        `json:"taskId"`
 }
 
 // logPromptRequest is sent to POST /Hooks/LogPrompt for audit purposes.
@@ -430,51 +443,68 @@ func handleReviewPlan(input []byte) {
 	}
 
 	const pollInterval = 3 * time.Second
-	const maxWait = 4 * time.Minute
+	const maxWait = 3 * time.Minute
 
 	start := time.Now()
 	deadline := start.Add(maxWait)
 
-	// Start the review — sends the full plan once.
-	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, base)
-	if err != nil {
-		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
-		fmt.Println(allowJSON())
-		return
-	}
-
-	var resp reviewResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		logMsg(fmt.Sprintf("allow (bad response: %v)", err))
-		fmt.Println(allowJSON())
-		return
-	}
-
-	// Poll until the server returns a final verdict (TaskID becomes empty).
-	// pendingCount tracks confirmed "still processing" responses from the server
-	// — it only increments when the server explicitly says the task is pending,
-	// not on network errors or retries. The hard limit is the time deadline.
-	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
-		elapsed := time.Since(start)
-		if time.Now().After(deadline) {
-			logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, elapsed.Seconds()))
-			fmt.Println(allowJSON())
-			return
-		}
-		logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
-			resp.TaskID, pendingCount, elapsed.Seconds(), time.Until(deadline).Seconds()))
-		time.Sleep(pollInterval)
-
-		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
-		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
+	// reviewOnce sends a ReviewPlan request (with any stored sessionState) and
+	// polls PollReview until the server returns a final verdict. Returns the
+	// final response, or (resp{}, false) if the server was unreachable / timed out.
+	reviewOnce := func(req reviewRequest) (reviewResponse, bool) {
+		respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, req)
 		if err != nil {
 			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
-			fmt.Println(allowJSON())
-			return
+			return reviewResponse{}, false
 		}
-		resp = reviewResponse{}
+
+		var resp reviewResponse
 		if err := json.Unmarshal(respBody, &resp); err != nil {
 			logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+			return reviewResponse{}, false
+		}
+
+		// Poll until the work item completes (TaskID becomes empty).
+		for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
+			if time.Now().After(deadline) {
+				logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, time.Since(start).Seconds()))
+				return reviewResponse{}, false
+			}
+			logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
+				resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds()))
+			time.Sleep(pollInterval)
+
+			pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
+			respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
+			if err != nil {
+				logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
+				return reviewResponse{}, false
+			}
+			resp = reviewResponse{}
+			if err := json.Unmarshal(respBody, &resp); err != nil {
+				logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+				return reviewResponse{}, false
+			}
+		}
+
+		return resp, true
+	}
+
+	// First review — no sessionState yet.
+	resp, ok := reviewOnce(base)
+	if !ok {
+		fmt.Println(allowJSON())
+		return
+	}
+
+	// Follow-up reviews — echo sessionState back until approved or no more state.
+	for !resp.Approved && resp.SessionState != nil {
+		logMsg(fmt.Sprintf("denied, review_count=%d — sending follow-up review", resp.SessionState.ReviewCount))
+		req := base
+		req.SessionState = resp.SessionState
+
+		resp, ok = reviewOnce(req)
+		if !ok {
 			fmt.Println(allowJSON())
 			return
 		}
