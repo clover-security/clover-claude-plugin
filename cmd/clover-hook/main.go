@@ -232,10 +232,10 @@ type sessionState struct {
 	ReviewCount         int                    `json:"reviewCount"`
 }
 
-// parseDismissals extracts [SKIP: <requirement> — <reason>] markers from the plan text.
-// Claude writes these when it has a context-based justification for not addressing
-// a security requirement. The server validates each reason before accepting it.
-func parseDismissals(plan string) []requirementDismissal {
+// parseDismissals extracts [SKIP:N — reason] markers from the plan text, where N
+// is the requirement number from the deny message. It resolves each number to the
+// actual requirement text from the current sessionState.Must list.
+func parseDismissals(plan string, mustRequirements []string) []requirementDismissal {
 	var dismissals []requirementDismissal
 	for _, line := range strings.Split(plan, "\n") {
 		line = strings.TrimSpace(line)
@@ -247,9 +247,26 @@ func parseDismissals(plan string) []requirementDismissal {
 		if len(parts) != 2 {
 			continue
 		}
+		key := strings.TrimSpace(parts[0])
+		reason := strings.TrimSpace(parts[1])
+
+		// Try to parse as a number and resolve to requirement text
+		if idx, err := fmt.Sscanf(key, "%d", new(int)); err == nil && idx == 1 {
+			var num int
+			fmt.Sscanf(key, "%d", &num)
+			if num >= 1 && num <= len(mustRequirements) {
+				dismissals = append(dismissals, requirementDismissal{
+					Requirement: mustRequirements[num-1],
+					Reason:      reason,
+				})
+				continue
+			}
+		}
+
+		// Fallback: treat key as raw requirement text
 		dismissals = append(dismissals, requirementDismissal{
-			Requirement: strings.TrimSpace(parts[0]),
-			Reason:      strings.TrimSpace(parts[1]),
+			Requirement: key,
+			Reason:      reason,
 		})
 	}
 	return dismissals
@@ -530,8 +547,12 @@ func handleReviewPlan(input []byte) {
 	}
 
 	// Follow-up reviews — echo sessionState back until approved or no more state.
-	// Parse [SKIP: ...] markers from the plan and attach as ignored requirements.
-	dismissals := parseDismissals(plan)
+	// Parse [SKIP:N — reason] markers from the plan, resolve N against must requirements.
+	var mustReqs []string
+	if resp.SessionState != nil {
+		mustReqs = resp.SessionState.Must
+	}
+	dismissals := parseDismissals(plan, mustReqs)
 	for !resp.Approved && resp.SessionState != nil {
 		logMsg(fmt.Sprintf("denied, review_count=%d dismissals=%d — sending follow-up review",
 			resp.SessionState.ReviewCount, len(dismissals)))
