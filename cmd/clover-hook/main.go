@@ -277,7 +277,7 @@ func parseSkipLines(plan string) []string {
 // and the plugin includes it on all subsequent calls.
 type reviewRequest struct {
 	Plan         string        `json:"plan"`                   // full plan text
-	PlanFile     string        `json:"plan_file"`              // path to plan file, if any
+	PlanFile     string        `json:"planFile"`               // path to plan file, if any
 	Repo         string        `json:"repo"`                   // git repository name
 	Branch       string        `json:"branch"`                 // current git branch
 	User         string        `json:"user"`                   // git user.name
