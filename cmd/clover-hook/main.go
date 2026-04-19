@@ -440,16 +440,60 @@ func getServerURL() string {
 // Hook handlers
 // =============================================================================
 
+// sessionStatePath returns the path for persisting sessionState between hook
+// invocations. Each ExitPlanMode event spawns a fresh binary, so we persist
+// to disk keyed by sessionId.
+func sessionStatePath(sessionId string) string {
+	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
+	if dataDir == "" {
+		dataDir = os.TempDir()
+	}
+	return filepath.Join(dataDir, "clover-session-"+sessionId+".json")
+}
+
+// loadSessionState reads persisted sessionState from disk for this session.
+// Returns nil if the file doesn't exist or is invalid.
+func loadSessionState(sessionId string) *sessionState {
+	data, err := os.ReadFile(sessionStatePath(sessionId))
+	if err != nil {
+		return nil
+	}
+	var state sessionState
+	if json.Unmarshal(data, &state) != nil {
+		return nil
+	}
+	return &state
+}
+
+// saveSessionState persists sessionState to disk so the next hook invocation
+// for this session can pick it up.
+func saveSessionState(sessionId string, state *sessionState) {
+	data, _ := json.Marshal(state)
+	os.WriteFile(sessionStatePath(sessionId), data, 0600)
+}
+
+// clearSessionState removes the persisted sessionState file when the session
+// is approved or exhausted.
+func clearSessionState(sessionId string) {
+	os.Remove(sessionStatePath(sessionId))
+}
+
 // handleReviewPlan is called when Claude Code fires the PreToolUse hook on
-// ExitPlanMode. It sends the plan to the Clover server for security review and
-// writes an allow or deny decision to stdout.
+// ExitPlanMode. Each invocation is a fresh process — sessionState is persisted
+// to disk between invocations so the server can judge updated plans against the
+// original requirements instead of re-analyzing from scratch.
 //
-// The review is async: the first call returns a taskId; subsequent calls to
-// /Hooks/PollReview check progress until a final verdict is returned. Polling
-// runs for up to 4 minutes (time-based deadline). The pending counter only
-// increments on confirmed "still processing" responses from the server, not on
-// network errors. The hook always allows on timeout or unreachable server — it
-// is a best-effort gate and must never block work due to infrastructure issues.
+// Flow across multiple ExitPlanMode events:
+//
+//  1st invocation (no persisted state):
+//    → POST /Hooks/ReviewPlan {plan} → {taskId} → poll → {denied, sessionState}
+//    → persist sessionState to disk → return deny to Claude
+//
+//  2nd invocation (persisted state found):
+//    → load sessionState from disk → parse [SKIP:N] markers from plan
+//    → POST /Hooks/ReviewPlan {plan, sessionState} → {approved/denied}
+//    → if denied: update persisted state → return deny
+//    → if approved: clear persisted state → return allow
 func handleReviewPlan(input []byte) {
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
@@ -481,7 +525,7 @@ func handleReviewPlan(input []byte) {
 		cwd = "."
 	}
 
-	base := reviewRequest{
+	req := reviewRequest{
 		Plan:      plan,
 		PlanFile:  hook.ToolInput.PlanFilePath,
 		Repo:      filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
@@ -491,101 +535,88 @@ func handleReviewPlan(input []byte) {
 		SessionID: hook.SessionID,
 	}
 
+	// Load persisted sessionState from a previous invocation (if any).
+	// If found, include it + any SKIP markers so the server judges instead
+	// of running a fresh analysis.
+	persisted := loadSessionState(hook.SessionID)
+	if persisted != nil {
+		dismissals := parseDismissals(plan, persisted.Must)
+		logMsg(fmt.Sprintf("loaded persisted state: review_count=%d must=%d dismissals=%d",
+			persisted.ReviewCount, len(persisted.Must), len(dismissals)))
+		sendState := *persisted
+		sendState.IgnoredRequirements = dismissals
+		req.SessionState = &sendState
+	}
+
 	const pollInterval = 3 * time.Second
 	const maxWait = 3 * time.Minute
 
 	start := time.Now()
 	deadline := start.Add(maxWait)
 
-	// reviewOnce sends a ReviewPlan request (with any stored sessionState) and
-	// polls PollReview until the server returns a final verdict. Returns the
-	// final response, or (resp{}, false) if the server was unreachable / timed out.
-	reviewOnce := func(req reviewRequest) (reviewResponse, bool) {
-		respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, req)
-		if err != nil {
-			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
-			return reviewResponse{}, false
-		}
-
-		var resp reviewResponse
-		if err := json.Unmarshal(respBody, &resp); err != nil {
-			logMsg(fmt.Sprintf("allow (bad response: %v)", err))
-			return reviewResponse{}, false
-		}
-
-		// Poll until the work item completes (TaskID becomes empty).
-		for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
-			if time.Now().After(deadline) {
-				logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, time.Since(start).Seconds()))
-				return reviewResponse{}, false
-			}
-			logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
-				resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds()))
-			time.Sleep(pollInterval)
-
-			pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
-			respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
-			if err != nil {
-				logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
-				return reviewResponse{}, false
-			}
-			resp = reviewResponse{}
-			if err := json.Unmarshal(respBody, &resp); err != nil {
-				logMsg(fmt.Sprintf("allow (bad response: %v)", err))
-				return reviewResponse{}, false
-			}
-		}
-
-		return resp, true
-	}
-
-	// First review — no sessionState yet.
-	resp, ok := reviewOnce(base)
-	if !ok {
+	// Send the review request.
+	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, req)
+	if err != nil {
+		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
 		fmt.Println(allowJSON())
 		return
 	}
 
-	// Store the initial sessionState from the first deny and maintain it across
-	// iterations. Only update reviewCount from subsequent responses — the Must
-	// list stays immutable from the first classification.
-	var storedState *sessionState
-	if resp.SessionState != nil {
-		storedState = resp.SessionState
+	var resp reviewResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+		fmt.Println(allowJSON())
+		return
 	}
 
-	for !resp.Approved && storedState != nil {
-		// Parse [SKIP:N — reason] from the plan using the stored must list
-		dismissals := parseDismissals(plan, storedState.Must)
-
-		logMsg(fmt.Sprintf("denied, review_count=%d dismissals=%d must=%d — sending follow-up review",
-			storedState.ReviewCount, len(dismissals), len(storedState.Must)))
-
-		// Build request with stored state + fresh dismissals
-		req := base
-		sendState := *storedState
-		sendState.IgnoredRequirements = dismissals
-		req.SessionState = &sendState
-
-		resp, ok = reviewOnce(req)
-		if !ok {
+	// Poll until the work item completes (only happens on first review when
+	// there's no persisted state — follow-up reviews are synchronous).
+	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
+		if time.Now().After(deadline) {
+			logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, time.Since(start).Seconds()))
 			fmt.Println(allowJSON())
 			return
 		}
+		logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
+			resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds()))
+		time.Sleep(pollInterval)
 
-		// Update reviewCount from the server response but keep our stored Must/Optional
-		if resp.SessionState != nil {
-			storedState.ReviewCount = resp.SessionState.ReviewCount
-		} else {
-			storedState = nil
+		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
+		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
+		if err != nil {
+			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
+			fmt.Println(allowJSON())
+			return
+		}
+		resp = reviewResponse{}
+		if err := json.Unmarshal(respBody, &resp); err != nil {
+			logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+			fmt.Println(allowJSON())
+			return
 		}
 	}
 
-	logMsg(fmt.Sprintf("result: approved=%v %.0fs", resp.Approved, time.Since(start).Seconds()))
+	// Persist or clear sessionState for the next hook invocation.
 	if resp.Approved {
+		clearSessionState(hook.SessionID)
+		logMsg(fmt.Sprintf("approved %.0fs", time.Since(start).Seconds()))
 		fmt.Println(allowJSON())
 	} else {
-		logMsg(fmt.Sprintf("deny (%d chars)", len(resp.Reason)))
+		// Persist state: keep Must from the first classification (persisted or
+		// newly received), only update ReviewCount.
+		if resp.SessionState != nil {
+			stateToSave := resp.SessionState
+			if persisted != nil {
+				// Keep original Must/Optional, only take updated ReviewCount
+				stateToSave = &sessionState{
+					Must:        persisted.Must,
+					Optional:    persisted.Optional,
+					ReviewCount: resp.SessionState.ReviewCount,
+				}
+			}
+			saveSessionState(hook.SessionID, stateToSave)
+		}
+		logMsg(fmt.Sprintf("deny (%d chars) %.0fs", len(resp.Reason), time.Since(start).Seconds()))
 		fmt.Println(denyJSON(resp.Reason))
 	}
 }
