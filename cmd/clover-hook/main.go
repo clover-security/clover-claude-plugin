@@ -85,15 +85,27 @@ var skipMarkerRegex = regexp.MustCompile(`\[SKIP:\s*\d+[^\]]*\]`)
 // logFile is the path where all hook activity is written for debugging.
 const logFile = "/tmp/clover-hook.log"
 
-// logMsg appends a timestamped message to the log file. Errors writing to the
-// log are silently ignored so the hook never fails due to logging issues.
+// logMsg appends a timestamped INFO-level message to the log file. Errors
+// writing to the log are silently ignored so the hook never fails due to
+// logging issues. See logf for level + structured key=value logging.
 func logMsg(msg string) {
+	logf("INFO", "%s", msg)
+}
+
+// logf is the structured-logging primitive. Prefer it over logMsg when adding
+// new logs: pass a level (INFO/WARN/ERROR/DEBUG) and a key=value formatted
+// message so the log is greppable (e.g. `grep 'session=abc' /tmp/clover-hook.log`).
+func logf(level string, format string, args ...any) {
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
+	fmt.Fprintf(f, "[%s] [%s] [pid=%d] %s\n",
+		time.Now().Format("2006-01-02 15:04:05.000"),
+		level,
+		os.Getpid(),
+		fmt.Sprintf(format, args...))
 }
 
 // =============================================================================
@@ -428,28 +440,46 @@ func sessionStatePath(sessionId string) string {
 // loadSessionState reads persisted sessionState from disk for this session.
 // Returns nil if the file doesn't exist or is invalid.
 func loadSessionState(sessionId string) *sessionState {
-	data, err := os.ReadFile(sessionStatePath(sessionId))
+	path := sessionStatePath(sessionId)
+	data, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			logf("WARN", "session_state read failed path=%s err=%v", path, err)
+		}
 		return nil
 	}
 	var state sessionState
-	if json.Unmarshal(data, &state) != nil {
+	if err := json.Unmarshal(data, &state); err != nil {
+		logf("WARN", "session_state unmarshal failed path=%s bytes=%d err=%v", path, len(data), err)
 		return nil
 	}
+	logf("DEBUG", "session_state loaded path=%s bytes=%d review_count=%d", path, len(data), state.ReviewCount)
 	return &state
 }
 
 // saveSessionState persists sessionState to disk so the next hook invocation
 // for this session can pick it up.
 func saveSessionState(sessionId string, state *sessionState) {
+	path := sessionStatePath(sessionId)
 	data, _ := json.Marshal(state)
-	os.WriteFile(sessionStatePath(sessionId), data, 0600)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		logf("WARN", "session_state write failed path=%s err=%v", path, err)
+		return
+	}
+	logf("DEBUG", "session_state written path=%s bytes=%d", path, len(data))
 }
 
 // clearSessionState removes the persisted sessionState file when the session
 // is approved or exhausted.
 func clearSessionState(sessionId string) {
-	os.Remove(sessionStatePath(sessionId))
+	path := sessionStatePath(sessionId)
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			logf("WARN", "session_state remove failed path=%s err=%v", path, err)
+		}
+		return
+	}
+	logf("DEBUG", "session_state removed path=%s", path)
 }
 
 // requirementsFilePath returns the path of the sidecar requirements file
@@ -479,12 +509,21 @@ func requirementsFilePath(planFile, sessionId string) string {
 // rewrite.
 func writeRequirementsFile(planFile, sessionId, reason string) {
 	path := requirementsFilePath(planFile, sessionId)
-	_ = os.WriteFile(path, []byte(reason+"\n"), 0600)
+	if err := os.WriteFile(path, []byte(reason+"\n"), 0600); err != nil {
+		logf("WARN", "sidecar write failed path=%s err=%v", path, err)
+	}
 }
 
 // clearRequirementsFile removes the sidecar requirements file on approval.
 func clearRequirementsFile(planFile, sessionId string) {
-	_ = os.Remove(requirementsFilePath(planFile, sessionId))
+	path := requirementsFilePath(planFile, sessionId)
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			logf("WARN", "sidecar remove failed path=%s err=%v", path, err)
+		}
+		return
+	}
+	logf("DEBUG", "sidecar removed path=%s", path)
 }
 
 // handleReviewPlan is called when Claude Code fires the PreToolUse hook on
@@ -504,30 +543,35 @@ func clearRequirementsFile(planFile, sessionId string) {
 //    → if denied: update persisted state → return deny
 //    → if approved: clear persisted state → return allow
 func handleReviewPlan(input []byte) {
+	logf("INFO", "=== review_plan hook fired input_size=%d", len(input))
+
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
-		logMsg(fmt.Sprintf("allow (parse error: %v)", err))
+		logf("ERROR", "action=allow reason=parse_error err=%v", err)
 		fmt.Println(allowJSON())
 		return
 	}
 
 	plan := hook.ToolInput.Plan
-	logMsg(fmt.Sprintf("--- session=%s plan=%dchars file=%s", hook.SessionID, len(plan), hook.ToolInput.PlanFilePath))
+	logf("INFO", "session=%s plan_chars=%d plan_file=%q cwd=%q",
+		hook.SessionID, len(plan), hook.ToolInput.PlanFilePath, hook.CWD)
 
 	if plan == "" {
-		logMsg("allow (no plan)")
+		logf("INFO", "action=allow reason=empty_plan session=%s", hook.SessionID)
 		fmt.Println(allowJSON())
 		return
 	}
 
 	token, err := getAccessToken()
 	if err != nil {
-		logMsg(fmt.Sprintf("allow (auth failed: %v)", err))
+		logf("ERROR", "action=allow reason=auth_failed session=%s err=%v", hook.SessionID, err)
 		fmt.Println(allowJSON())
 		return
 	}
+	logf("DEBUG", "auth ok session=%s", hook.SessionID)
 
 	serverURL := getServerURL()
+	logf("DEBUG", "server_url=%s session=%s", serverURL, hook.SessionID)
 
 	cwd := hook.CWD
 	if cwd == "" {
@@ -543,6 +587,8 @@ func handleReviewPlan(input []byte) {
 		Email:     getClaudeEmail(),
 		SessionID: hook.SessionID,
 	}
+	logf("INFO", "git repo=%q branch=%q user=%q email=%q session=%s",
+		req.Repo, req.Branch, req.User, req.Email, hook.SessionID)
 
 	// Load persisted sessionState from a previous invocation (if any).
 	// If found, include it so the server judges instead of re-analyzing.
@@ -550,10 +596,15 @@ func handleReviewPlan(input []byte) {
 	persisted := loadSessionState(hook.SessionID)
 	if persisted != nil {
 		skipLines := parseSkipLines(plan)
-		logMsg(fmt.Sprintf("loaded persisted state: review_count=%d must=%d skips=%d",
-			persisted.ReviewCount, len(persisted.Must), len(skipLines)))
+		logf("INFO", "flow=judge persisted_state review_count=%d must=%d optional=%d skips_found=%d session=%s",
+			persisted.ReviewCount, len(persisted.Must), len(persisted.Optional), len(skipLines), hook.SessionID)
+		for i, skip := range skipLines {
+			logf("DEBUG", "skip_marker[%d]=%q session=%s", i, skip, hook.SessionID)
+		}
 		req.SessionState = persisted
 		req.SkipLines = skipLines
+	} else {
+		logf("INFO", "flow=start no_persisted_state session=%s", hook.SessionID)
 	}
 
 	const pollInterval = 3 * time.Second
@@ -563,16 +614,20 @@ func handleReviewPlan(input []byte) {
 	deadline := start.Add(maxWait)
 
 	// Send the review request.
+	logf("DEBUG", "POST %s/Hooks/ReviewPlan session=%s", serverURL, hook.SessionID)
 	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, req)
 	if err != nil {
-		logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
+		logf("ERROR", "action=allow reason=server_unreachable elapsed=%.1fs session=%s err=%v",
+			time.Since(start).Seconds(), hook.SessionID, err)
 		fmt.Println(allowJSON())
 		return
 	}
+	logf("DEBUG", "review response bytes=%d elapsed=%.1fs session=%s",
+		len(respBody), time.Since(start).Seconds(), hook.SessionID)
 
 	var resp reviewResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+		logf("ERROR", "action=allow reason=bad_response session=%s err=%v", hook.SessionID, err)
 		fmt.Println(allowJSON())
 		return
 	}
@@ -581,34 +636,53 @@ func handleReviewPlan(input []byte) {
 	// there's no persisted state — follow-up reviews are synchronous).
 	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
 		if time.Now().After(deadline) {
-			logMsg(fmt.Sprintf("allow (poll timeout after %d pending responses, %.0fs)", pendingCount, time.Since(start).Seconds()))
+			logf("WARN", "action=allow reason=poll_timeout polls=%d elapsed=%.1fs session=%s task=%s",
+				pendingCount, time.Since(start).Seconds(), hook.SessionID, resp.TaskID)
 			fmt.Println(allowJSON())
 			return
 		}
-		logMsg(fmt.Sprintf("pending task=%s count=%d elapsed=%.0fs remaining=%.0fs",
-			resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds()))
+		logf("INFO", "poll pending task=%s count=%d elapsed=%.1fs remaining=%.1fs session=%s",
+			resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds(), hook.SessionID)
 		time.Sleep(pollInterval)
 
 		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
 		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
 		if err != nil {
-			logMsg(fmt.Sprintf("allow (server unreachable %.0fs: %v)", time.Since(start).Seconds(), err))
+			logf("ERROR", "action=allow reason=server_unreachable_on_poll elapsed=%.1fs session=%s err=%v",
+				time.Since(start).Seconds(), hook.SessionID, err)
 			fmt.Println(allowJSON())
 			return
 		}
 		resp = reviewResponse{}
 		if err := json.Unmarshal(respBody, &resp); err != nil {
-			logMsg(fmt.Sprintf("allow (bad response: %v)", err))
+			logf("ERROR", "action=allow reason=bad_poll_response session=%s err=%v", hook.SessionID, err)
 			fmt.Println(allowJSON())
 			return
 		}
 	}
 
+	// Log the final verdict details before acting on it.
+	mustCount, optCount := 0, 0
+	if resp.SessionState != nil {
+		mustCount = len(resp.SessionState.Must)
+		optCount = len(resp.SessionState.Optional)
+	}
+	logf("INFO", "verdict approved=%t reason_chars=%d must=%d optional=%d review_count=%d elapsed=%.1fs session=%s",
+		resp.Approved, len(resp.Reason), mustCount, optCount,
+		func() int {
+			if resp.SessionState != nil {
+				return resp.SessionState.ReviewCount
+			}
+			return 0
+		}(),
+		time.Since(start).Seconds(), hook.SessionID)
+
 	// Persist or clear sessionState for the next hook invocation.
 	if resp.Approved {
 		clearSessionState(hook.SessionID)
 		clearRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID)
-		logMsg(fmt.Sprintf("approved %.0fs", time.Since(start).Seconds()))
+		logf("INFO", "action=allow reason=approved session_state_cleared sidecar_cleared elapsed=%.1fs session=%s",
+			time.Since(start).Seconds(), hook.SessionID)
 		fmt.Println(allowJSON())
 	} else {
 		// Persist state: keep Must from the first classification (persisted or
@@ -622,14 +696,24 @@ func handleReviewPlan(input []byte) {
 					Optional:    persisted.Optional,
 					ReviewCount: resp.SessionState.ReviewCount,
 				}
+				logf("DEBUG", "preserving original must=%d optional=%d from persisted state session=%s",
+					len(persisted.Must), len(persisted.Optional), hook.SessionID)
 			}
 			saveSessionState(hook.SessionID, stateToSave)
+			logf("INFO", "persisted session_state path=%s review_count=%d must=%d session=%s",
+				sessionStatePath(hook.SessionID), stateToSave.ReviewCount, len(stateToSave.Must), hook.SessionID)
+		} else {
+			logf("WARN", "deny response had no sessionState — subsequent reviews will restart session=%s", hook.SessionID)
 		}
 		// Write the deny reason (requirements + skip instructions) next to the
 		// plan file so the agent can reference it reliably on the next pass —
 		// more robust than hoping [SKIP:N] markers survive a plan rewrite.
+		sidecar := requirementsFilePath(hook.ToolInput.PlanFilePath, hook.SessionID)
 		writeRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID, resp.Reason)
-		logMsg(fmt.Sprintf("deny (%d chars) %.0fs", len(resp.Reason), time.Since(start).Seconds()))
+		logf("INFO", "sidecar_written path=%s bytes=%d session=%s",
+			sidecar, len(resp.Reason), hook.SessionID)
+		logf("INFO", "action=deny reason_chars=%d elapsed=%.1fs session=%s",
+			len(resp.Reason), time.Since(start).Seconds(), hook.SessionID)
 		fmt.Println(denyJSON(resp.Reason))
 	}
 }
