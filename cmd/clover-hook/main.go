@@ -497,6 +497,74 @@ func clearSessionState(sessionId string) {
 	logf("DEBUG", "session_state removed path=%s", path)
 }
 
+// findPlanFile tries to locate the on-disk markdown file that matches the plan
+// text Claude Code passed in the hook payload. Claude Code's hook payload for
+// ExitPlanMode is NOT documented to include a file path, but Claude Code does
+// persist plans to ~/.claude/plans/<slug>.md. This function best-effort finds
+// that file so the server can store its path for caching/future dedup.
+//
+// Strategy:
+//  1. List ~/.claude/plans/*.md.
+//  2. Return the file whose (whitespace-normalised) content equals the plan.
+//  3. Fall back to the most-recently-modified *.md in that directory if its
+//     mtime is within 60s of now — Claude just wrote it for this invocation.
+//  4. Otherwise return "" (server column stays NULL — no harm done).
+func findPlanFile(plan string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logf("DEBUG", "plan_file lookup: UserHomeDir failed: %v", err)
+		return ""
+	}
+	plansDir := filepath.Join(home, ".claude", "plans")
+
+	entries, err := os.ReadDir(plansDir)
+	if err != nil {
+		logf("DEBUG", "plan_file lookup: ReadDir %s failed: %v", plansDir, err)
+		return ""
+	}
+
+	normalisedPlan := strings.TrimSpace(plan)
+
+	var (
+		bestMtimeMatch os.FileInfo
+		bestMtimePath  string
+	)
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(plansDir, entry.Name())
+
+		// Content match first — strongest signal.
+		data, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(data)) == normalisedPlan {
+			logf("DEBUG", "plan_file lookup: content match path=%s", path)
+			return path
+		}
+
+		// Track the most recently modified file as a fallback.
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if bestMtimeMatch == nil || info.ModTime().After(bestMtimeMatch.ModTime()) {
+			bestMtimeMatch = info
+			bestMtimePath = path
+		}
+	}
+
+	// Fallback: mtime within the last 60 seconds — Claude likely just wrote it.
+	if bestMtimeMatch != nil && time.Since(bestMtimeMatch.ModTime()) < 60*time.Second {
+		logf("DEBUG", "plan_file lookup: mtime fallback path=%s age=%.1fs",
+			bestMtimePath, time.Since(bestMtimeMatch.ModTime()).Seconds())
+		return bestMtimePath
+	}
+
+	logf("DEBUG", "plan_file lookup: no match in %s (entries=%d)", plansDir, len(entries))
+	return ""
+}
+
 // requirementsFilePath returns the path of the sidecar requirements file
 // written next to the agent's plan file. When the plan is at
 // /path/to/plan.md, the requirements go to /path/to/plan.clover-requirements.md.
@@ -568,8 +636,18 @@ func handleReviewPlan(input []byte) {
 	}
 
 	plan := hook.ToolInput.Plan
-	logf("INFO", "session=%s plan_chars=%d plan_file=%q cwd=%q",
-		hook.SessionID, len(plan), hook.ToolInput.PlanFilePath, hook.CWD)
+	// Claude Code doesn't pass the plan's on-disk path in the hook payload (the
+	// documented tool_input for ExitPlanMode only contains `plan`). Keep reading
+	// the `planFilePath` field in case a future Code version starts sending it,
+	// but fall back to looking in ~/.claude/plans/ ourselves (see findPlanFile).
+	// Empty string is fine — server column is nullable.
+	hookPlanFilePath := hook.ToolInput.PlanFilePath
+	planFilePath := hookPlanFilePath
+	if planFilePath == "" {
+		planFilePath = findPlanFile(plan)
+	}
+	logf("INFO", "session=%s plan_chars=%d plan_file=%q hook_plan_file=%q cwd=%q",
+		hook.SessionID, len(plan), planFilePath, hookPlanFilePath, hook.CWD)
 
 	if plan == "" {
 		logf("INFO", "action=allow reason=empty_plan session=%s", hook.SessionID)
@@ -595,7 +673,7 @@ func handleReviewPlan(input []byte) {
 
 	req := reviewRequest{
 		Plan:      plan,
-		PlanFile:  hook.ToolInput.PlanFilePath,
+		PlanFile:  planFilePath,
 		Repo:      filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
 		Branch:    gitCmd(cwd, "branch", "--show-current"),
 		User:      gitCmd(cwd, "config", "user.name"),
@@ -708,7 +786,7 @@ func handleReviewPlan(input []byte) {
 	// Persist or clear sessionState for the next hook invocation.
 	if resp.Approved {
 		clearSessionState(hook.SessionID)
-		clearRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID)
+		clearRequirementsFile(planFilePath, hook.SessionID)
 		logf("INFO", "action=allow reason=approved session_state_cleared sidecar_cleared elapsed=%.1fs session=%s",
 			time.Since(start).Seconds(), hook.SessionID)
 		fmt.Println(allowJSON())
@@ -743,8 +821,8 @@ func handleReviewPlan(input []byte) {
 		// Write the deny reason (requirements + skip instructions) next to the
 		// plan file so the agent can reference it reliably on the next pass —
 		// more robust than hoping [SKIP:N] markers survive a plan rewrite.
-		sidecar := requirementsFilePath(hook.ToolInput.PlanFilePath, hook.SessionID)
-		writeRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID, resp.Reason)
+		sidecar := requirementsFilePath(planFilePath, hook.SessionID)
+		writeRequirementsFile(planFilePath, hook.SessionID, resp.Reason)
 		logf("INFO", "sidecar_written path=%s bytes=%d session=%s",
 			sidecar, len(resp.Reason), hook.SessionID)
 		logf("INFO", "action=deny reason_chars=%d elapsed=%.1fs session=%s",
