@@ -546,25 +546,38 @@ func handleReviewPlan(input []byte) {
 		return
 	}
 
-	// Follow-up reviews — echo sessionState back until approved or no more state.
-	// Parse [SKIP:N — reason] markers from the plan, resolve N against must requirements.
-	var mustReqs []string
+	// Store the initial sessionState from the first deny and maintain it across
+	// iterations. Only update reviewCount from subsequent responses — the Must
+	// list stays immutable from the first classification.
+	var storedState *sessionState
 	if resp.SessionState != nil {
-		mustReqs = resp.SessionState.Must
+		storedState = resp.SessionState
 	}
-	dismissals := parseDismissals(plan, mustReqs)
-	for !resp.Approved && resp.SessionState != nil {
-		logMsg(fmt.Sprintf("denied, review_count=%d dismissals=%d — sending follow-up review",
-			resp.SessionState.ReviewCount, len(dismissals)))
+
+	for !resp.Approved && storedState != nil {
+		// Parse [SKIP:N — reason] from the plan using the stored must list
+		dismissals := parseDismissals(plan, storedState.Must)
+
+		logMsg(fmt.Sprintf("denied, review_count=%d dismissals=%d must=%d — sending follow-up review",
+			storedState.ReviewCount, len(dismissals), len(storedState.Must)))
+
+		// Build request with stored state + fresh dismissals
 		req := base
-		state := *resp.SessionState
-		state.IgnoredRequirements = dismissals
-		req.SessionState = &state
+		sendState := *storedState
+		sendState.IgnoredRequirements = dismissals
+		req.SessionState = &sendState
 
 		resp, ok = reviewOnce(req)
 		if !ok {
 			fmt.Println(allowJSON())
 			return
+		}
+
+		// Update reviewCount from the server response but keep our stored Must/Optional
+		if resp.SessionState != nil {
+			storedState.ReviewCount = resp.SessionState.ReviewCount
+		} else {
+			storedState = nil
 		}
 	}
 
