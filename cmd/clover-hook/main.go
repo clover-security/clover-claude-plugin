@@ -60,9 +60,7 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -247,7 +245,7 @@ type toolInput struct {
 // and write its final Approved/Denied status. Dropping this field here means
 // every follow-up round looks like a brand-new session to the database.
 //
-// LastPlanHash + LastDenyReason are plugin-local fields (the server never sees
+// LastPlan + LastDenyReason are plugin-local fields (the server never sees
 // them). They enable the "plan unchanged → short-circuit" optimization: if the
 // agent triggers ExitPlanMode with the same plan text we already judged, we
 // re-emit the previous deny reason without calling the server and without
@@ -256,20 +254,10 @@ type toolInput struct {
 type sessionState struct {
 	CodingPlanId   string   `json:"codingPlanId,omitempty"`
 	LastDenyReason string   `json:"lastDenyReason,omitempty"`
-	LastPlanHash   string   `json:"lastPlanHash,omitempty"`
+	LastPlan       string   `json:"lastPlan,omitempty"`
 	Must           []string `json:"must"`
 	Optional       []string `json:"optional,omitempty"`
 	ReviewCount    int      `json:"reviewCount"`
-}
-
-// hashPlan returns a short hex SHA-256 of the plan text, normalised for
-// insignificant whitespace so trivial reformatting doesn't defeat the
-// short-circuit. Leading/trailing whitespace and CRLF→LF are stripped; the
-// rest is compared verbatim.
-func hashPlan(plan string) string {
-	normalised := strings.ReplaceAll(strings.TrimSpace(plan), "\r\n", "\n")
-	sum := sha256.Sum256([]byte(normalised))
-	return hex.EncodeToString(sum[:])
 }
 
 // parseSkipLines extracts every [SKIP:N — reason] marker from the plan text,
@@ -621,31 +609,30 @@ func handleReviewPlan(input []byte) {
 	// If found, include it so the server judges instead of re-analyzing.
 	// Raw [SKIP:N] lines are sent separately for the server to parse.
 	persisted := loadSessionState(hook.SessionID)
-	planHash := hashPlan(plan)
 
 	if persisted != nil {
 		// Short-circuit: if the plan text is identical to the last round we
 		// already denied, re-emit the cached deny reason without a server call
-		// and without bumping the review counter. This removes the "repeat the
-		// same plan until the server auto-approves" escape hatch while keeping
-		// the UX responsive when the agent triggers ExitPlanMode with no edits.
-		if persisted.LastPlanHash != "" && persisted.LastPlanHash == planHash && persisted.LastDenyReason != "" {
-			logf("INFO", "short_circuit plan_unchanged hash=%s review_count=%d session=%s — re-deny from cache",
-				planHash[:12], persisted.ReviewCount, hook.SessionID)
+		// and without bumping the review counter. Removes the "repeat the same
+		// plan until the server auto-approves" escape hatch; responsive when
+		// the agent triggers ExitPlanMode with no edits.
+		if persisted.LastPlan != "" && persisted.LastPlan == plan && persisted.LastDenyReason != "" {
+			logf("INFO", "short_circuit plan_unchanged review_count=%d session=%s — re-deny from cache",
+				persisted.ReviewCount, hook.SessionID)
 			fmt.Println(denyJSON(persisted.LastDenyReason))
 			return
 		}
 
 		skipLines := parseSkipLines(plan)
-		logf("INFO", "flow=judge persisted_state review_count=%d must=%d optional=%d skips_found=%d plan_hash=%s session=%s",
-			persisted.ReviewCount, len(persisted.Must), len(persisted.Optional), len(skipLines), planHash[:12], hook.SessionID)
+		logf("INFO", "flow=judge persisted_state review_count=%d must=%d optional=%d skips_found=%d session=%s",
+			persisted.ReviewCount, len(persisted.Must), len(persisted.Optional), len(skipLines), hook.SessionID)
 		for i, skip := range skipLines {
 			logf("DEBUG", "skip_marker[%d]=%q session=%s", i, skip, hook.SessionID)
 		}
 		req.SessionState = persisted
 		req.SkipLines = skipLines
 	} else {
-		logf("INFO", "flow=start no_persisted_state plan_hash=%s session=%s", planHash[:12], hook.SessionID)
+		logf("INFO", "flow=start no_persisted_state session=%s", hook.SessionID)
 	}
 
 	const pollInterval = 3 * time.Second
@@ -743,13 +730,13 @@ func handleReviewPlan(input []byte) {
 				logf("DEBUG", "preserving original must=%d optional=%d coding_plan_id=%s from persisted state session=%s",
 					len(persisted.Must), len(persisted.Optional), persisted.CodingPlanId, hook.SessionID)
 			}
-			// Record this round's plan hash + deny reason so the next invocation
-			// can short-circuit if the agent resubmits the same plan verbatim.
-			stateToSave.LastPlanHash = planHash
+			// Record this round's plan + deny reason so the next invocation can
+			// short-circuit if the agent resubmits the same plan verbatim.
+			stateToSave.LastPlan = plan
 			stateToSave.LastDenyReason = resp.Reason
 			saveSessionState(hook.SessionID, stateToSave)
-			logf("INFO", "persisted session_state path=%s review_count=%d must=%d plan_hash=%s session=%s",
-				sessionStatePath(hook.SessionID), stateToSave.ReviewCount, len(stateToSave.Must), planHash[:12], hook.SessionID)
+			logf("INFO", "persisted session_state path=%s review_count=%d must=%d session=%s",
+				sessionStatePath(hook.SessionID), stateToSave.ReviewCount, len(stateToSave.Must), hook.SessionID)
 		} else {
 			logf("WARN", "deny response had no sessionState — subsequent reviews will restart session=%s", hook.SessionID)
 		}
