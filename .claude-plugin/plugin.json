@@ -1,6 +1,6 @@
 {
   "name": "clover",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "description": "Clover security review — automatically analyzes plans for security requirements before implementation",
   "author": {
     "name": "Clover Security"
