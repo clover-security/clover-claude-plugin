@@ -444,6 +444,41 @@ func clearSessionState(sessionId string) {
 	os.Remove(sessionStatePath(sessionId))
 }
 
+// requirementsFilePath returns the path of the sidecar requirements file
+// written next to the agent's plan file. When the plan is at
+// /path/to/plan.md, the requirements go to /path/to/plan.clover-requirements.md.
+// If the plan file is unknown we fall back to $CLAUDE_PLUGIN_DATA so the file
+// still persists across hook invocations keyed by sessionId.
+func requirementsFilePath(planFile, sessionId string) string {
+	if planFile != "" {
+		dir := filepath.Dir(planFile)
+		base := filepath.Base(planFile)
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+		return filepath.Join(dir, stem+".clover-requirements.md")
+	}
+	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
+	if dataDir == "" {
+		dataDir = os.TempDir()
+	}
+	return filepath.Join(dataDir, "clover-requirements-"+sessionId+".md")
+}
+
+// writeRequirementsFile persists the deny reason (which contains the MUST
+// requirements and skip instructions) next to the plan file. This gives the
+// agent a stable, file-based reference of what it must address on the next
+// pass — more robust than relying on the [SKIP:N] markers surviving a plan
+// rewrite.
+func writeRequirementsFile(planFile, sessionId, reason string) {
+	path := requirementsFilePath(planFile, sessionId)
+	_ = os.WriteFile(path, []byte(reason+"\n"), 0600)
+}
+
+// clearRequirementsFile removes the sidecar requirements file on approval.
+func clearRequirementsFile(planFile, sessionId string) {
+	_ = os.Remove(requirementsFilePath(planFile, sessionId))
+}
+
 // handleReviewPlan is called when Claude Code fires the PreToolUse hook on
 // ExitPlanMode. Each invocation is a fresh process — sessionState is persisted
 // to disk between invocations so the server can judge updated plans against the
@@ -564,6 +599,7 @@ func handleReviewPlan(input []byte) {
 	// Persist or clear sessionState for the next hook invocation.
 	if resp.Approved {
 		clearSessionState(hook.SessionID)
+		clearRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID)
 		logMsg(fmt.Sprintf("approved %.0fs", time.Since(start).Seconds()))
 		fmt.Println(allowJSON())
 	} else {
@@ -581,6 +617,10 @@ func handleReviewPlan(input []byte) {
 			}
 			saveSessionState(hook.SessionID, stateToSave)
 		}
+		// Write the deny reason (requirements + skip instructions) next to the
+		// plan file so the agent can reference it reliably on the next pass —
+		// more robust than hoping [SKIP:N] markers survive a plan rewrite.
+		writeRequirementsFile(hook.ToolInput.PlanFilePath, hook.SessionID, resp.Reason)
 		logMsg(fmt.Sprintf("deny (%d chars) %.0fs", len(resp.Reason), time.Since(start).Seconds()))
 		fmt.Println(denyJSON(resp.Reason))
 	}
