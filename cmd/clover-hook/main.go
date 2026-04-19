@@ -214,62 +214,27 @@ type toolInput struct {
 	PlanFilePath string `json:"planFilePath"`
 }
 
-// requirementDismissal represents a requirement the agent has chosen to skip,
-// with a context-based reason. Sent to the server for validation.
-type requirementDismissal struct {
-	Requirement string `json:"requirement"`
-	Reason      string `json:"reason"`
-}
-
 // sessionState holds classified security requirements returned by the server
 // after analysis completes. The plugin stores it and echoes it back on every
 // subsequent ReviewPlan call so the server can remain stateless.
-// IgnoredRequirements is populated from [SKIP: ...] markers in the plan.
 type sessionState struct {
-	IgnoredRequirements []requirementDismissal `json:"ignoredRequirements,omitempty"`
-	Must                []string               `json:"must"`
-	Optional            []string               `json:"optional,omitempty"`
-	ReviewCount         int                    `json:"reviewCount"`
+	Must        []string `json:"must"`
+	Optional    []string `json:"optional,omitempty"`
+	ReviewCount int      `json:"reviewCount"`
 }
 
-// parseDismissals extracts [SKIP:N — reason] markers from the plan text, where N
-// is the requirement number from the deny message. It resolves each number to the
-// actual requirement text from the current sessionState.Must list.
-func parseDismissals(plan string, mustRequirements []string) []requirementDismissal {
-	var dismissals []requirementDismissal
+// parseSkipLines extracts raw [SKIP:...] lines from the plan text.
+// The server is responsible for parsing the key and reason — the plugin
+// just forwards the raw marker strings.
+func parseSkipLines(plan string) []string {
+	var skips []string
 	for _, line := range strings.Split(plan, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "[SKIP:") || !strings.HasSuffix(line, "]") {
-			continue
+		if strings.HasPrefix(line, "[SKIP:") && strings.HasSuffix(line, "]") {
+			skips = append(skips, line)
 		}
-		inner := strings.TrimSpace(line[6 : len(line)-1])
-		parts := strings.SplitN(inner, "—", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		reason := strings.TrimSpace(parts[1])
-
-		// Try to parse as a number and resolve to requirement text
-		if idx, err := fmt.Sscanf(key, "%d", new(int)); err == nil && idx == 1 {
-			var num int
-			fmt.Sscanf(key, "%d", &num)
-			if num >= 1 && num <= len(mustRequirements) {
-				dismissals = append(dismissals, requirementDismissal{
-					Requirement: mustRequirements[num-1],
-					Reason:      reason,
-				})
-				continue
-			}
-		}
-
-		// Fallback: treat key as raw requirement text
-		dismissals = append(dismissals, requirementDismissal{
-			Requirement: key,
-			Reason:      reason,
-		})
 	}
-	return dismissals
+	return skips
 }
 
 // reviewRequest is sent to POST /Hooks/ReviewPlan to start or continue a review.
@@ -284,6 +249,7 @@ type reviewRequest struct {
 	Email        string        `json:"email"`                  // Claude Code authenticated user email
 	SessionID    string        `json:"sessionId"`              // Claude Code session ID
 	SessionState *sessionState `json:"sessionState,omitempty"` // echoed from previous response
+	SkipLines    []string      `json:"skipLines,omitempty"`    // raw [SKIP:N — reason] lines from plan
 }
 
 // pollRequest is sent to POST /Hooks/PollReview to check whether a previously
@@ -536,16 +502,15 @@ func handleReviewPlan(input []byte) {
 	}
 
 	// Load persisted sessionState from a previous invocation (if any).
-	// If found, include it + any SKIP markers so the server judges instead
-	// of running a fresh analysis.
+	// If found, include it so the server judges instead of re-analyzing.
+	// Raw [SKIP:N] lines are sent separately for the server to parse.
 	persisted := loadSessionState(hook.SessionID)
 	if persisted != nil {
-		dismissals := parseDismissals(plan, persisted.Must)
-		logMsg(fmt.Sprintf("loaded persisted state: review_count=%d must=%d dismissals=%d",
-			persisted.ReviewCount, len(persisted.Must), len(dismissals)))
-		sendState := *persisted
-		sendState.IgnoredRequirements = dismissals
-		req.SessionState = &sendState
+		skipLines := parseSkipLines(plan)
+		logMsg(fmt.Sprintf("loaded persisted state: review_count=%d must=%d skips=%d",
+			persisted.ReviewCount, len(persisted.Must), len(skipLines)))
+		req.SessionState = persisted
+		req.SkipLines = skipLines
 	}
 
 	const pollInterval = 3 * time.Second
