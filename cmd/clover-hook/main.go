@@ -239,10 +239,16 @@ type toolInput struct {
 // sessionState holds classified security requirements returned by the server
 // after analysis completes. The plugin stores it and echoes it back on every
 // subsequent ReviewPlan call so the server can remain stateless.
+//
+// CodingPlanId is the server-side identifier for the persisted coding_plan row.
+// It MUST be round-tripped verbatim — the server uses it to look up the plan
+// and write its final Approved/Denied status. Dropping this field here means
+// every follow-up round looks like a brand-new session to the database.
 type sessionState struct {
-	Must        []string `json:"must"`
-	Optional    []string `json:"optional,omitempty"`
-	ReviewCount int      `json:"reviewCount"`
+	CodingPlanId string   `json:"codingPlanId,omitempty"`
+	Must         []string `json:"must"`
+	Optional     []string `json:"optional,omitempty"`
+	ReviewCount  int      `json:"reviewCount"`
 }
 
 // parseSkipLines extracts every [SKIP:N — reason] marker from the plan text,
@@ -690,14 +696,17 @@ func handleReviewPlan(input []byte) {
 		if resp.SessionState != nil {
 			stateToSave := resp.SessionState
 			if persisted != nil {
-				// Keep original Must/Optional, only take updated ReviewCount
+				// Keep original Must/Optional + CodingPlanId, only take updated ReviewCount.
+				// CodingPlanId MUST be preserved across rounds so the server can write
+				// the final Approved/Denied status on the correct coding_plan row.
 				stateToSave = &sessionState{
-					Must:        persisted.Must,
-					Optional:    persisted.Optional,
-					ReviewCount: resp.SessionState.ReviewCount,
+					CodingPlanId: persisted.CodingPlanId,
+					Must:         persisted.Must,
+					Optional:     persisted.Optional,
+					ReviewCount:  resp.SessionState.ReviewCount,
 				}
-				logf("DEBUG", "preserving original must=%d optional=%d from persisted state session=%s",
-					len(persisted.Must), len(persisted.Optional), hook.SessionID)
+				logf("DEBUG", "preserving original must=%d optional=%d coding_plan_id=%s from persisted state session=%s",
+					len(persisted.Must), len(persisted.Optional), persisted.CodingPlanId, hook.SessionID)
 			}
 			saveSessionState(hook.SessionID, stateToSave)
 			logf("INFO", "persisted session_state path=%s review_count=%d must=%d session=%s",
