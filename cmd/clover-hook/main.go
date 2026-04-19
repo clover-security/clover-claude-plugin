@@ -214,13 +214,45 @@ type toolInput struct {
 	PlanFilePath string `json:"planFilePath"`
 }
 
+// requirementDismissal represents a requirement the agent has chosen to skip,
+// with a context-based reason. Sent to the server for validation.
+type requirementDismissal struct {
+	Requirement string `json:"requirement"`
+	Reason      string `json:"reason"`
+}
+
 // sessionState holds classified security requirements returned by the server
 // after analysis completes. The plugin stores it and echoes it back on every
 // subsequent ReviewPlan call so the server can remain stateless.
+// IgnoredRequirements is populated from [SKIP: ...] markers in the plan.
 type sessionState struct {
-	Must        []string `json:"must"`
-	Optional    []string `json:"optional,omitempty"`
-	ReviewCount int      `json:"reviewCount"`
+	IgnoredRequirements []requirementDismissal `json:"ignoredRequirements,omitempty"`
+	Must                []string               `json:"must"`
+	Optional            []string               `json:"optional,omitempty"`
+	ReviewCount         int                    `json:"reviewCount"`
+}
+
+// parseDismissals extracts [SKIP: <requirement> — <reason>] markers from the plan text.
+// Claude writes these when it has a context-based justification for not addressing
+// a security requirement. The server validates each reason before accepting it.
+func parseDismissals(plan string) []requirementDismissal {
+	var dismissals []requirementDismissal
+	for _, line := range strings.Split(plan, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[SKIP:") || !strings.HasSuffix(line, "]") {
+			continue
+		}
+		inner := strings.TrimSpace(line[6 : len(line)-1])
+		parts := strings.SplitN(inner, "—", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		dismissals = append(dismissals, requirementDismissal{
+			Requirement: strings.TrimSpace(parts[0]),
+			Reason:      strings.TrimSpace(parts[1]),
+		})
+	}
+	return dismissals
 }
 
 // reviewRequest is sent to POST /Hooks/ReviewPlan to start or continue a review.
@@ -498,10 +530,15 @@ func handleReviewPlan(input []byte) {
 	}
 
 	// Follow-up reviews — echo sessionState back until approved or no more state.
+	// Parse [SKIP: ...] markers from the plan and attach as ignored requirements.
+	dismissals := parseDismissals(plan)
 	for !resp.Approved && resp.SessionState != nil {
-		logMsg(fmt.Sprintf("denied, review_count=%d — sending follow-up review", resp.SessionState.ReviewCount))
+		logMsg(fmt.Sprintf("denied, review_count=%d dismissals=%d — sending follow-up review",
+			resp.SessionState.ReviewCount, len(dismissals)))
 		req := base
-		req.SessionState = resp.SessionState
+		state := *resp.SessionState
+		state.IgnoredRequirements = dismissals
+		req.SessionState = &state
 
 		resp, ok = reviewOnce(req)
 		if !ok {
