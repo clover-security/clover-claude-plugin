@@ -68,9 +68,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// skipMarkerRegex finds [SKIP:N — reason] markers anywhere in the plan text,
+// not just on lines that start with "[SKIP:". Claude often inlines the marker
+// inside a bullet or sentence, so we match across the whole plan.
+//   - `\[SKIP:`        — literal opening
+//   - `\s*\d+`         — the 1-based requirement index, tolerant of whitespace
+//   - `[^\]]*`         — anything up to the closing bracket (the reason)
+//   - `\]`             — literal closing
+var skipMarkerRegex = regexp.MustCompile(`\[SKIP:\s*\d+[^\]]*\]`)
 
 // logFile is the path where all hook activity is written for debugging.
 const logFile = "/tmp/clover-hook.log"
@@ -223,18 +233,16 @@ type sessionState struct {
 	ReviewCount int      `json:"reviewCount"`
 }
 
-// parseSkipLines extracts raw [SKIP:...] lines from the plan text.
-// The server is responsible for parsing the key and reason — the plugin
-// just forwards the raw marker strings.
+// parseSkipLines extracts every [SKIP:N — reason] marker from the plan text,
+// regardless of whether it sits on its own line or inline inside a bullet or
+// sentence. The server is responsible for parsing the index and reason — the
+// plugin just forwards the raw marker strings.
 func parseSkipLines(plan string) []string {
-	var skips []string
-	for _, line := range strings.Split(plan, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[SKIP:") && strings.HasSuffix(line, "]") {
-			skips = append(skips, line)
-		}
+	matches := skipMarkerRegex.FindAllString(plan, -1)
+	if matches == nil {
+		return nil
 	}
-	return skips
+	return matches
 }
 
 // reviewRequest is sent to POST /Hooks/ReviewPlan to start or continue a review.
