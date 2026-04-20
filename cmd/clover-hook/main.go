@@ -1,61 +1,5 @@
-// Package main implements the clover-hook binary — a Claude Code plugin hook
-// that intercepts plan-mode exits and runs a server-side security review before
-// allowing the agent to proceed.
-//
-// # How it works
-//
-// Claude Code calls this binary at two points during a session:
-//
-//  1. PreToolUse on ExitPlanMode — the agent is about to leave plan mode and
-//     start implementing. The hook sends the plan to the Clover server for a
-//     security review. If the server finds unaddressed MUST requirements, the
-//     hook returns "deny" and Claude Code blocks the action, showing the
-//     developer the missing security items.
-//
-//  2. UserPromptSubmit — the user submitted a prompt. The hook forwards it to
-//     the server for audit logging (fire-and-forget, never blocks).
-//
-// # Review flow
-//
-// Because security analysis can take 20–30 seconds (entity resolution, LLM
-// calls), the review uses an async pattern:
-//
-//  POST /Hooks/ReviewPlan  { plan, repo, branch, sessionId }
-//       → { taskId }                       (analysis queued, poll for result)
-//
-//  POST /Hooks/PollReview  { sessionId, taskId }
-//       → { taskId }                       (still processing, wait and retry)
-//       → { approved, reason }             (final verdict)
-//
-// If the server is unreachable or the review times out, the hook always
-// approves — it never blocks work due to infrastructure issues.
-//
-// # Session model
-//
-// The server tracks a session (keyed by Claude Code's session_id) across
-// multiple plan reviews. The first review fetches and classifies security
-// requirements; subsequent reviews in the same session only judge whether the
-// updated plan addresses the previously identified MUST requirements. After
-// 4 reviews or a passing verdict the session is cleared.
-//
-// # Configuration
-//
-// The binary is configured via environment variables, typically set by the
-// Claude Code plugin framework:
-//
-//	CLOVER_CLIENT_ID / CLAUDE_PLUGIN_OPTION_CLIENT_ID       — Frontegg API client ID
-//	CLOVER_CLIENT_SECRET / CLAUDE_PLUGIN_OPTION_CLIENT_SECRET — Frontegg API secret
-//	CLOVER_SERVER_URL / CLAUDE_PLUGIN_OPTION_SERVER_URL     — Clover API base URL (default: https://app.cloversec.io)
-//	CLOVER_AUTH_URL / CLAUDE_PLUGIN_OPTION_AUTH_URL         — Frontegg auth URL (default: https://clover.frontegg.com)
-//	CLAUDE_PLUGIN_DATA                                       — directory for caching the auth token
-//
-// # Debugging
-//
-// All activity is appended to /tmp/clover-hook.log with timestamps.
-// To force a fresh auth token, delete the cached token file:
-//
-//	rm /tmp/clover-token.json            # default location
-//	rm $CLAUDE_PLUGIN_DATA/token.json    # if CLAUDE_PLUGIN_DATA is set
+// clover-hook is a Claude Code plugin hook that intercepts plan-mode exits and
+// runs a server-side security review before the agent starts implementing.
 package main
 
 import (
@@ -73,28 +17,11 @@ import (
 	"time"
 )
 
-// skipMarkerRegex finds [SKIP:N — reason] markers anywhere in the plan text,
-// not just on lines that start with "[SKIP:". Claude often inlines the marker
-// inside a bullet or sentence, so we match across the whole plan.
-//   - `\[SKIP:`        — literal opening
-//   - `\s*\d+`         — the 1-based requirement index, tolerant of whitespace
-//   - `[^\]]*`         — anything up to the closing bracket (the reason)
-//   - `\]`             — literal closing
+// skipMarkerRegex matches [SKIP:N — reason] anywhere in text.
 var skipMarkerRegex = regexp.MustCompile(`\[SKIP:\s*\d+[^\]]*\]`)
 
-// logFile is the path where all hook activity is written for debugging.
 const logFile = "/tmp/clover-hook.log"
 
-// logMsg appends a timestamped INFO-level message to the log file. Errors
-// writing to the log are silently ignored so the hook never fails due to
-// logging issues. See logf for level + structured key=value logging.
-func logMsg(msg string) {
-	logf("INFO", "%s", msg)
-}
-
-// logf is the structured-logging primitive. Prefer it over logMsg when adding
-// new logs: pass a level (INFO/WARN/ERROR/DEBUG) and a key=value formatted
-// message so the log is greppable (e.g. `grep 'session=abc' /tmp/clover-hook.log`).
 func logf(level string, format string, args ...any) {
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -109,148 +36,95 @@ func logf(level string, format string, args ...any) {
 }
 
 // =============================================================================
-// Auth — Frontegg API token exchange and file-based caching
+// Auth
 // =============================================================================
 
-// tokenResponse is the JSON body returned by the Frontegg token endpoint.
 type tokenResponse struct {
 	AccessToken string `json:"accessToken"`
 	ExpiresIn   int    `json:"expiresIn"`
-	TokenType   string `json:"tokenType"`
 }
 
-// cachedTokenFile is the structure persisted to disk to avoid re-authenticating
-// on every hook invocation.
 type cachedTokenFile struct {
 	Token     string `json:"token"`
-	ExpiresAt int64  `json:"expires_at"` // Unix timestamp; token is refreshed 60s early
+	ExpiresAt int64  `json:"expires_at"`
 }
 
-// getAuthURL returns the Frontegg base URL, configurable via environment.
-func getAuthURL() string {
-	authURL := getEnv("CLOVER_AUTH_URL", "CLAUDE_PLUGIN_OPTION_AUTH_URL")
-	if authURL == "" {
-		return "https://clover.frontegg.com"
-	}
-	return strings.TrimRight(authURL, "/")
-}
-
-// tokenCachePath returns the path to the cached token file.
-// Defaults to /tmp/clover-token.json unless CLAUDE_PLUGIN_DATA is set.
 func tokenCachePath() string {
-	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
-	if dataDir == "" {
-		return "/tmp/clover-token.json"
+	if d := getEnv("CLAUDE_PLUGIN_DATA"); d != "" {
+		return filepath.Join(d, "token.json")
 	}
-	return filepath.Join(dataDir, "token.json")
+	return "/tmp/clover-token.json"
 }
 
-// loadCachedToken reads the cached token from disk and returns it if it has
-// not expired. Returns ("", false) if the file is missing, invalid, or stale.
 func loadCachedToken() (string, bool) {
 	data, err := os.ReadFile(tokenCachePath())
 	if err != nil {
 		return "", false
 	}
-	var cached cachedTokenFile
-	if json.Unmarshal(data, &cached) != nil {
+	var c cachedTokenFile
+	if json.Unmarshal(data, &c) != nil || time.Now().Unix() >= c.ExpiresAt {
 		return "", false
 	}
-	if time.Now().Unix() >= cached.ExpiresAt {
-		return "", false
-	}
-	return cached.Token, true
+	return c.Token, true
 }
 
-// saveCachedToken writes the token to disk with an expiry 60 seconds before
-// the server-reported expiry to avoid using a token that is about to expire.
 func saveCachedToken(token string, expiresIn int) {
-	cached := cachedTokenFile{
-		Token:     token,
-		ExpiresAt: time.Now().Add(time.Duration(expiresIn-60) * time.Second).Unix(),
-	}
-	data, _ := json.Marshal(cached)
+	c := cachedTokenFile{Token: token, ExpiresAt: time.Now().Add(time.Duration(expiresIn-60) * time.Second).Unix()}
+	data, _ := json.Marshal(c)
 	os.WriteFile(tokenCachePath(), data, 0600)
 }
 
-// getAccessToken returns a valid Frontegg API token, using the disk cache when
-// possible. On cache miss it exchanges the client credentials for a new token
-// and saves it. Returns an error if credentials are missing or auth fails.
 func getAccessToken() (string, error) {
 	if token, ok := loadCachedToken(); ok {
 		return token, nil
 	}
-
 	clientID := getEnv("CLOVER_CLIENT_ID", "CLAUDE_PLUGIN_OPTION_CLIENT_ID")
 	clientSecret := getEnv("CLOVER_CLIENT_SECRET", "CLAUDE_PLUGIN_OPTION_CLIENT_SECRET")
-
 	if clientID == "" || clientSecret == "" {
 		return "", fmt.Errorf("missing client_id or client_secret")
 	}
-
-	authURL := getAuthURL() + "/identity/resources/auth/v1/api-token"
-
-	body, _ := json.Marshal(map[string]string{
-		"clientId": clientID,
-		"secret":   clientSecret,
-	})
-
-	resp, err := httpClient().Post(authURL, "application/json", bytes.NewReader(body))
+	authURL := strings.TrimRight(getEnv("CLOVER_AUTH_URL", "CLAUDE_PLUGIN_OPTION_AUTH_URL"), "/")
+	if authURL == "" {
+		authURL = "https://clover.frontegg.com"
+	}
+	body, _ := json.Marshal(map[string]string{"clientId": clientID, "secret": clientSecret})
+	resp, err := httpClient().Post(authURL+"/identity/resources/auth/v1/api-token", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("auth request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("auth returned %d: %s", resp.StatusCode, string(respBody))
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("auth returned %d: %s", resp.StatusCode, string(b))
 	}
-
-	var tokenResp tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", fmt.Errorf("auth response parse error: %w", err)
+	var t tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
+		return "", fmt.Errorf("auth parse error: %w", err)
 	}
-
-	saveCachedToken(tokenResp.AccessToken, tokenResp.ExpiresIn)
-
-	logMsg(fmt.Sprintf("token acquired, expires in %ds", tokenResp.ExpiresIn))
-	return tokenResp.AccessToken, nil
+	saveCachedToken(t.AccessToken, t.ExpiresIn)
+	logf("DEBUG", "token acquired expires_in=%ds", t.ExpiresIn)
+	return t.AccessToken, nil
 }
 
 // =============================================================================
-// Request / response models
+// Models
 // =============================================================================
 
-// hookInput is the JSON payload Claude Code sends to the hook binary on stdin.
 type hookInput struct {
-	SessionID string    `json:"session_id"`  // unique ID for this Claude Code session
-	CWD       string    `json:"cwd"`         // working directory of the Claude Code process
+	SessionID string    `json:"session_id"`
+	CWD       string    `json:"cwd"`
 	HookEvent string    `json:"hook_event_name"`
 	ToolName  string    `json:"tool_name"`
 	ToolInput toolInput `json:"tool_input"`
 }
 
-// toolInput carries the plan text written by the agent when exiting plan mode.
 type toolInput struct {
 	Plan         string `json:"plan"`
-	PlanFilePath string `json:"planFilePath"`
+	PlanFilePath string `json:"planFilePath"` // may be absent; we fall back to findPlanFile
 }
 
-// sessionState holds classified security requirements returned by the server
-// after analysis completes. The plugin stores it and echoes it back on every
-// subsequent ReviewPlan call so the server can remain stateless.
-//
-// CodingPlanId is the server-side identifier for the persisted coding_plan row.
-// It MUST be round-tripped verbatim — the server uses it to look up the plan
-// and write its final Approved/Denied status. Dropping this field here means
-// every follow-up round looks like a brand-new session to the database.
-//
-// LastPlan + LastDenyReason are plugin-local fields (the server never sees
-// them). They enable the "plan unchanged → short-circuit" optimization: if the
-// agent triggers ExitPlanMode with the same plan text we already judged, we
-// re-emit the previous deny reason without calling the server and without
-// bumping the server's review counter. This prevents repeated identical
-// submissions from eventually tripping the server's max-reviews auto-approve.
+// sessionState is round-tripped verbatim between plugin invocations and the server.
+// LastPlan / LastDenyReason are plugin-local (server ignores them).
 type sessionState struct {
 	CodingPlanId   string   `json:"codingPlanId,omitempty"`
 	LastDenyReason string   `json:"lastDenyReason,omitempty"`
@@ -260,58 +134,23 @@ type sessionState struct {
 	ReviewCount    int      `json:"reviewCount"`
 }
 
-// parseSkipLinesFromSidecar reads the dedicated skips file and extracts every
-// [SKIP:N — reason] marker from it. The agent writes skip decisions to
-// {plan-stem}.clover-skips.md — a file separate from the requirements file —
-// so it cannot accidentally overwrite the requirements while adding skips.
-//
-// Returns nil if the skips file doesn't exist or contains no markers.
-func parseSkipLinesFromSidecar(planFile, sessionId string) []string {
-	path := skipsFilePath(planFile, sessionId)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			logf("WARN", "skip read: file read failed path=%s err=%v", path, err)
-		}
-		return nil
-	}
-	logf("DEBUG", "skip read: path=%s bytes=%d", path, len(data))
-	matches := skipMarkerRegex.FindAllString(string(data), -1)
-	if matches == nil {
-		return nil
-	}
-	return matches
-}
-
-// reviewRequest is sent to POST /Hooks/ReviewPlan to start or continue a review.
-// SessionState is omitted on the first call; the server returns it after analysis
-// and the plugin includes it on all subsequent calls.
 type reviewRequest struct {
-	Plan         string        `json:"plan"`                   // full plan text
-	PlanFile     string        `json:"planFile"`               // path to plan file, if any
-	Repo         string        `json:"repo"`                   // git repository name
-	Branch       string        `json:"branch"`                 // current git branch
-	User         string        `json:"user"`                   // git user.name
-	Email        string        `json:"email"`                  // Claude Code authenticated user email
-	SessionID    string        `json:"sessionId"`              // Claude Code session ID
-	SessionState *sessionState `json:"sessionState,omitempty"` // echoed from previous response
-	SkipLines    []string      `json:"skipLines,omitempty"`    // raw [SKIP:N — reason] lines from plan
+	Plan         string        `json:"plan"`
+	PlanFile     string        `json:"planFile,omitempty"`
+	Repo         string        `json:"repo"`
+	Branch       string        `json:"branch"`
+	User         string        `json:"user"`
+	Email        string        `json:"email"`
+	SessionID    string        `json:"sessionId"`
+	SessionState *sessionState `json:"sessionState,omitempty"`
+	SkipLines    []string      `json:"skipLines,omitempty"`
 }
 
-// pollRequest is sent to POST /Hooks/PollReview to check whether a previously
-// queued review has completed. Much smaller than reviewRequest — no plan text.
 type pollRequest struct {
 	SessionID string `json:"sessionId"`
 	TaskID    string `json:"taskId"`
 }
 
-// reviewResponse is returned by both /Hooks/ReviewPlan and /Hooks/PollReview.
-//
-//   - TaskID non-empty → analysis is still running; poll again after a short wait.
-//   - TaskID empty, Approved true → plan passed security review; proceed.
-//   - TaskID empty, Approved false → plan has unaddressed MUST requirements;
-//     Reason contains a human-readable list to show the developer.
-//   - SessionState non-nil → store and echo back on the next ReviewPlan call.
 type reviewResponse struct {
 	Approved     bool          `json:"approved"`
 	Reason       string        `json:"reason"`
@@ -319,45 +158,10 @@ type reviewResponse struct {
 	TaskID       string        `json:"taskId"`
 }
 
-// logPromptRequest is sent to POST /Hooks/LogPrompt for audit purposes.
-// This call is fire-and-forget and never blocks the user.
-type logPromptRequest struct {
-	Prompt string `json:"prompt"`
-	User   string `json:"user"`
-	Email  string `json:"email"`
-	Repo   string `json:"repo"`
-	Branch string `json:"branch"`
-}
-
 // =============================================================================
-// Claude Code hook output helpers
+// Utilities
 // =============================================================================
 
-// allowJSON returns the JSON payload that tells Claude Code to allow the action.
-func allowJSON() string {
-	return `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
-}
-
-// denyJSON returns the JSON payload that tells Claude Code to block the action
-// and display reason to the developer.
-func denyJSON(reason string) string {
-	output := map[string]interface{}{
-		"hookSpecificOutput": map[string]interface{}{
-			"hookEventName":            "PreToolUse",
-			"permissionDecision":       "deny",
-			"permissionDecisionReason": reason,
-		},
-	}
-	b, _ := json.Marshal(output)
-	return string(b)
-}
-
-// =============================================================================
-// Utility helpers
-// =============================================================================
-
-// getEnv returns the value of the first environment variable in keys that is
-// non-empty, or "" if none are set. Supports fallback keys for compatibility.
 func getEnv(keys ...string) string {
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
@@ -367,25 +171,23 @@ func getEnv(keys ...string) string {
 	return ""
 }
 
-// getClaudeEmail returns the email of the Claude Code authenticated user by
-// running `claude auth status --json`. Returns "" if the command fails.
+func getServerURL() string {
+	if u := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "https://app.cloversec.io"
+}
+
 func getClaudeEmail() string {
-	cmd := exec.Command("claude", "auth", "status", "--json")
-	out, err := cmd.Output()
+	out, err := exec.Command("claude", "auth", "status", "--json").Output()
 	if err != nil {
 		return ""
 	}
-	var result struct {
-		Email string `json:"email"`
-	}
-	if json.Unmarshal(out, &result) == nil {
-		return result.Email
-	}
-	return ""
+	var r struct{ Email string `json:"email"` }
+	json.Unmarshal(out, &r)
+	return r.Email
 }
 
-// gitCmd runs a git command in the given directory and returns trimmed stdout.
-// Returns "unknown" if the command fails.
 func gitCmd(dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -396,25 +198,18 @@ func gitCmd(dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// httpClient returns an HTTP client with a 5-minute timeout. TLS verification
-// is disabled to support self-signed certs in local/staging environments.
 func httpClient() *http.Client {
 	return &http.Client{
-		Timeout: 5 * time.Minute,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
+		Timeout:   5 * time.Minute,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
 }
 
-// postJSON marshals body as JSON, POSTs it to url with a Bearer token header,
-// and returns the response body. Returns an error for non-2xx status codes.
 func postJSON(url, token string, body interface{}) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-
 	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -423,48 +218,48 @@ func postJSON(url, token string, body interface{}) ([]byte, error) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
 	resp, err := httpClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body2, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body2))
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(b))
 	}
-	return body2, nil
+	return b, nil
 }
 
-// getServerURL returns the Clover API base URL, configurable via environment.
-func getServerURL() string {
-	url := getEnv("CLOVER_SERVER_URL", "CLAUDE_PLUGIN_OPTION_SERVER_URL")
-	if url == "" {
-		return "https://app.cloversec.io"
-	}
-	return strings.TrimRight(url, "/")
+func allowJSON() string {
+	return `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
+}
+
+func denyJSON(reason string) string {
+	b, _ := json.Marshal(map[string]interface{}{
+		"hookSpecificOutput": map[string]interface{}{
+			"hookEventName":            "PreToolUse",
+			"permissionDecision":       "deny",
+			"permissionDecisionReason": reason,
+		},
+	})
+	return string(b)
 }
 
 // =============================================================================
-// Hook handlers
+// Session state
 // =============================================================================
 
-// sessionStatePath returns the path for persisting sessionState between hook
-// invocations. Each ExitPlanMode event spawns a fresh binary, so we persist
-// to disk keyed by sessionId.
 func sessionStatePath(sessionId string) string {
-	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
-	if dataDir == "" {
-		dataDir = os.TempDir()
+	d := getEnv("CLAUDE_PLUGIN_DATA")
+	if d == "" {
+		d = os.TempDir()
 	}
-	return filepath.Join(dataDir, "clover-session-"+sessionId+".json")
+	return filepath.Join(d, "clover-session-"+sessionId+".json")
 }
 
-// loadSessionState reads persisted sessionState from disk for this session.
-// Returns nil if the file doesn't exist or is invalid.
 func loadSessionState(sessionId string) *sessionState {
 	path := sessionStatePath(sessionId)
 	data, err := os.ReadFile(path)
@@ -474,183 +269,120 @@ func loadSessionState(sessionId string) *sessionState {
 		}
 		return nil
 	}
-	var state sessionState
-	if err := json.Unmarshal(data, &state); err != nil {
-		logf("WARN", "session_state unmarshal failed path=%s bytes=%d err=%v", path, len(data), err)
+	var s sessionState
+	if err := json.Unmarshal(data, &s); err != nil {
+		logf("WARN", "session_state unmarshal failed path=%s err=%v", path, err)
 		return nil
 	}
-	logf("DEBUG", "session_state loaded path=%s bytes=%d review_count=%d", path, len(data), state.ReviewCount)
-	return &state
+	logf("DEBUG", "session_state loaded review_count=%d path=%s", s.ReviewCount, path)
+	return &s
 }
 
-// saveSessionState persists sessionState to disk so the next hook invocation
-// for this session can pick it up.
 func saveSessionState(sessionId string, state *sessionState) {
 	path := sessionStatePath(sessionId)
 	data, _ := json.Marshal(state)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		logf("WARN", "session_state write failed path=%s err=%v", path, err)
-		return
 	}
-	logf("DEBUG", "session_state written path=%s bytes=%d", path, len(data))
 }
 
-// clearSessionState removes the persisted sessionState file when the session
-// is approved or exhausted.
 func clearSessionState(sessionId string) {
-	path := sessionStatePath(sessionId)
-	if err := os.Remove(path); err != nil {
-		if !os.IsNotExist(err) {
-			logf("WARN", "session_state remove failed path=%s err=%v", path, err)
-		}
-		return
-	}
-	logf("DEBUG", "session_state removed path=%s", path)
+	os.Remove(sessionStatePath(sessionId))
 }
 
-// findPlanFile tries to locate the on-disk markdown file that matches the plan
-// text Claude Code passed in the hook payload. Claude Code's hook payload for
-// ExitPlanMode is NOT documented to include a file path, but Claude Code does
-// persist plans to ~/.claude/plans/<slug>.md. This function best-effort finds
-// that file so the server can store its path for caching/future dedup.
-//
-// Strategy:
-//  1. List ~/.claude/plans/*.md.
-//  2. Return the file whose (whitespace-normalised) content equals the plan.
-//  3. Fall back to the most-recently-modified *.md in that directory if its
-//     mtime is within 60s of now — Claude just wrote it for this invocation.
-//  4. Otherwise return "" (server column stays NULL — no harm done).
-func findPlanFile(plan string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		logf("DEBUG", "plan_file lookup: UserHomeDir failed: %v", err)
-		return ""
-	}
-	plansDir := filepath.Join(home, ".claude", "plans")
+// =============================================================================
+// Sidecar files
+// =============================================================================
 
-	entries, err := os.ReadDir(plansDir)
-	if err != nil {
-		logf("DEBUG", "plan_file lookup: ReadDir %s failed: %v", plansDir, err)
-		return ""
-	}
-
-	normalisedPlan := strings.TrimSpace(plan)
-
-	var (
-		bestMtimeMatch os.FileInfo
-		bestMtimePath  string
-	)
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-			continue
-		}
-		path := filepath.Join(plansDir, entry.Name())
-
-		// Content match first — strongest signal.
-		data, err := os.ReadFile(path)
-		if err == nil && strings.TrimSpace(string(data)) == normalisedPlan {
-			logf("DEBUG", "plan_file lookup: content match path=%s", path)
-			return path
-		}
-
-		// Track the most recently modified file as a fallback.
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if bestMtimeMatch == nil || info.ModTime().After(bestMtimeMatch.ModTime()) {
-			bestMtimeMatch = info
-			bestMtimePath = path
-		}
-	}
-
-	// Fallback: mtime within the last 60 seconds — Claude likely just wrote it.
-	if bestMtimeMatch != nil && time.Since(bestMtimeMatch.ModTime()) < 60*time.Second {
-		logf("DEBUG", "plan_file lookup: mtime fallback path=%s age=%.1fs",
-			bestMtimePath, time.Since(bestMtimeMatch.ModTime()).Seconds())
-		return bestMtimePath
-	}
-
-	logf("DEBUG", "plan_file lookup: no match in %s (entries=%d)", plansDir, len(entries))
-	return ""
-}
-
-// sidecarPath builds a path in the same directory as the plan file, with a
-// given suffix. Falls back to $CLAUDE_PLUGIN_DATA (or os.TempDir) when the
-// plan file path is unknown, keyed by sessionId.
+// sidecarPath builds {plan-stem}{suffix} next to the plan file, falling back
+// to $CLAUDE_PLUGIN_DATA keyed by sessionId when the plan path is unknown.
 func sidecarPath(planFile, sessionId, suffix string) string {
 	if planFile != "" {
-		dir := filepath.Dir(planFile)
 		base := filepath.Base(planFile)
-		ext := filepath.Ext(base)
-		stem := strings.TrimSuffix(base, ext)
-		return filepath.Join(dir, stem+suffix)
+		stem := strings.TrimSuffix(base, filepath.Ext(base))
+		return filepath.Join(filepath.Dir(planFile), stem+suffix)
 	}
-	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
-	if dataDir == "" {
-		dataDir = os.TempDir()
+	d := getEnv("CLAUDE_PLUGIN_DATA")
+	if d == "" {
+		d = os.TempDir()
 	}
-	return filepath.Join(dataDir, "clover-"+sessionId+suffix)
+	return filepath.Join(d, "clover-"+sessionId+suffix)
 }
 
-// requirementsFilePath returns the path of the requirements sidecar written
-// by the plugin on deny. The agent reads this file to see what to address.
-// It must NOT edit or delete it — skip decisions go to the skips file.
 func requirementsFilePath(planFile, sessionId string) string {
 	return sidecarPath(planFile, sessionId, ".clover-requirements.md")
 }
 
-// skipsFilePath returns the path of the skips sidecar. The agent writes
-// [SKIP:N — reason] lines here when it wants to skip a requirement.
-// Separate from the requirements file so the agent can't accidentally
-// overwrite the requirements while adding skips.
 func skipsFilePath(planFile, sessionId string) string {
 	return sidecarPath(planFile, sessionId, ".clover-skips.md")
 }
 
-// writeRequirementsFile persists the deny reason (which contains the MUST
-// requirements and skip instructions) next to the plan file. This gives the
-// agent a stable, file-based reference of what it must address on the next
-// pass — more robust than relying on the [SKIP:N] markers surviving a plan
-// rewrite.
 func writeRequirementsFile(planFile, sessionId, reason string) {
-	path := requirementsFilePath(planFile, sessionId)
-	if err := os.WriteFile(path, []byte(reason+"\n"), 0600); err != nil {
-		logf("WARN", "sidecar write failed path=%s err=%v", path, err)
+	if err := os.WriteFile(requirementsFilePath(planFile, sessionId), []byte(reason+"\n"), 0600); err != nil {
+		logf("WARN", "requirements write failed err=%v", err)
 	}
 }
 
-// clearRequirementsFile removes the sidecar requirements file on approval.
-func clearRequirementsFile(planFile, sessionId string) {
-	path := requirementsFilePath(planFile, sessionId)
-	if err := os.Remove(path); err != nil {
-		if !os.IsNotExist(err) {
-			logf("WARN", "sidecar remove failed path=%s err=%v", path, err)
+func clearSidecarFiles(planFile, sessionId string) {
+	os.Remove(requirementsFilePath(planFile, sessionId))
+	os.Remove(skipsFilePath(planFile, sessionId))
+}
+
+// parseSkipLinesFromSidecar reads skip decisions from the dedicated skips file.
+// The agent writes [SKIP:N — reason] lines to {plan-stem}.clover-skips.md,
+// keeping the plan text and requirements file untouched.
+func parseSkipLinesFromSidecar(planFile, sessionId string) []string {
+	data, err := os.ReadFile(skipsFilePath(planFile, sessionId))
+	if err != nil {
+		return nil
+	}
+	return skipMarkerRegex.FindAllString(string(data), -1)
+}
+
+// findPlanFile discovers the plan's on-disk path by scanning ~/.claude/plans/.
+// Prefers an exact content match; falls back to the most-recently-modified
+// .md file if it was written within the last 60 seconds.
+func findPlanFile(plan string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	plansDir := filepath.Join(home, ".claude", "plans")
+	entries, err := os.ReadDir(plansDir)
+	if err != nil {
+		return ""
+	}
+	norm := strings.TrimSpace(plan)
+	var latestInfo os.FileInfo
+	var latestPath string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
 		}
-		return
+		path := filepath.Join(plansDir, e.Name())
+		if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) == norm {
+			logf("DEBUG", "plan_file content_match path=%s", path)
+			return path
+		}
+		if info, err := e.Info(); err == nil {
+			if latestInfo == nil || info.ModTime().After(latestInfo.ModTime()) {
+				latestInfo, latestPath = info, path
+			}
+		}
 	}
-	logf("DEBUG", "sidecar removed path=%s", path)
+	if latestInfo != nil && time.Since(latestInfo.ModTime()) < 60*time.Second {
+		logf("DEBUG", "plan_file mtime_fallback path=%s", latestPath)
+		return latestPath
+	}
+	return ""
 }
 
-// handleReviewPlan is called when Claude Code fires the PreToolUse hook on
-// ExitPlanMode. Each invocation is a fresh process — sessionState is persisted
-// to disk between invocations so the server can judge updated plans against the
-// original requirements instead of re-analyzing from scratch.
-//
-// Flow across multiple ExitPlanMode events:
-//
-//  1st invocation (no persisted state):
-//    → POST /Hooks/ReviewPlan {plan} → {taskId} → poll → {denied, sessionState}
-//    → persist sessionState to disk → return deny to Claude
-//
-//  2nd invocation (persisted state found):
-//    → load sessionState from disk → parse [SKIP:N] markers from plan
-//    → POST /Hooks/ReviewPlan {plan, sessionState} → {approved/denied}
-//    → if denied: update persisted state → return deny
-//    → if approved: clear persisted state → return allow
+// =============================================================================
+// Hook handlers
+// =============================================================================
+
 func handleReviewPlan(input []byte) {
-	logf("INFO", "=== review_plan hook fired input_size=%d", len(input))
+	logf("INFO", "=== review_plan fired input_size=%d", len(input))
 
 	var hook hookInput
 	if err := json.Unmarshal(input, &hook); err != nil {
@@ -660,18 +392,12 @@ func handleReviewPlan(input []byte) {
 	}
 
 	plan := hook.ToolInput.Plan
-	// Claude Code doesn't pass the plan's on-disk path in the hook payload (the
-	// documented tool_input for ExitPlanMode only contains `plan`). Keep reading
-	// the `planFilePath` field in case a future Code version starts sending it,
-	// but fall back to looking in ~/.claude/plans/ ourselves (see findPlanFile).
-	// Empty string is fine — server column is nullable.
-	hookPlanFilePath := hook.ToolInput.PlanFilePath
-	planFilePath := hookPlanFilePath
+	planFilePath := hook.ToolInput.PlanFilePath
 	if planFilePath == "" {
 		planFilePath = findPlanFile(plan)
 	}
-	logf("INFO", "session=%s plan_chars=%d plan_file=%q hook_plan_file=%q cwd=%q",
-		hook.SessionID, len(plan), planFilePath, hookPlanFilePath, hook.CWD)
+	logf("INFO", "session=%s plan_chars=%d plan_file=%q cwd=%q",
+		hook.SessionID, len(plan), planFilePath, hook.CWD)
 
 	if plan == "" {
 		logf("INFO", "action=allow reason=empty_plan session=%s", hook.SessionID)
@@ -685,10 +411,6 @@ func handleReviewPlan(input []byte) {
 		fmt.Println(allowJSON())
 		return
 	}
-	logf("DEBUG", "auth ok session=%s", hook.SessionID)
-
-	serverURL := getServerURL()
-	logf("DEBUG", "server_url=%s session=%s", serverURL, hook.SessionID)
 
 	cwd := hook.CWD
 	if cwd == "" {
@@ -704,56 +426,35 @@ func handleReviewPlan(input []byte) {
 		Email:     getClaudeEmail(),
 		SessionID: hook.SessionID,
 	}
-	logf("INFO", "git repo=%q branch=%q user=%q email=%q session=%s",
-		req.Repo, req.Branch, req.User, req.Email, hook.SessionID)
+	logf("INFO", "git repo=%q branch=%q user=%q session=%s", req.Repo, req.Branch, req.User, hook.SessionID)
 
-	// Load persisted sessionState from a previous invocation (if any).
-	// If found, include it so the server judges instead of re-analyzing.
-	// Raw [SKIP:N] lines are sent separately for the server to parse.
 	persisted := loadSessionState(hook.SessionID)
 
 	if persisted != nil {
-		// Short-circuit: if the plan text is identical to the last round we
-		// already denied, re-emit the cached deny reason without a server call
-		// and without bumping the review counter. Removes the "repeat the same
-		// plan until the server auto-approves" escape hatch; responsive when
-		// the agent triggers ExitPlanMode with no edits.
-		if persisted.LastPlan != "" && persisted.LastPlan == plan && persisted.LastDenyReason != "" {
-			logf("INFO", "short_circuit plan_unchanged review_count=%d session=%s — re-deny from cache",
-				persisted.ReviewCount, hook.SessionID)
+		// Same plan as last deny — no point calling server again.
+		if persisted.LastPlan == plan && persisted.LastDenyReason != "" {
+			logf("INFO", "short_circuit plan_unchanged review_count=%d session=%s", persisted.ReviewCount, hook.SessionID)
 			fmt.Println(denyJSON(persisted.LastDenyReason))
 			return
 		}
-
 		skipLines := parseSkipLinesFromSidecar(planFilePath, hook.SessionID)
-		logf("INFO", "flow=judge persisted_state review_count=%d must=%d optional=%d skips_found=%d session=%s",
-			persisted.ReviewCount, len(persisted.Must), len(persisted.Optional), len(skipLines), hook.SessionID)
-		for i, skip := range skipLines {
-			logf("DEBUG", "skip_marker[%d]=%q session=%s", i, skip, hook.SessionID)
-		}
+		logf("INFO", "flow=judge review_count=%d must=%d skips=%d session=%s",
+			persisted.ReviewCount, len(persisted.Must), len(skipLines), hook.SessionID)
 		req.SessionState = persisted
 		req.SkipLines = skipLines
 	} else {
-		logf("INFO", "flow=start no_persisted_state session=%s", hook.SessionID)
+		logf("INFO", "flow=start session=%s", hook.SessionID)
 	}
 
-	const pollInterval = 3 * time.Second
-	const maxWait = 3 * time.Minute
-
 	start := time.Now()
-	deadline := start.Add(maxWait)
+	deadline := start.Add(3 * time.Minute)
 
-	// Send the review request.
-	logf("DEBUG", "POST %s/Hooks/ReviewPlan session=%s", serverURL, hook.SessionID)
-	respBody, err := postJSON(serverURL+"/Hooks/ReviewPlan", token, req)
+	respBody, err := postJSON(getServerURL()+"/Hooks/ReviewPlan", token, req)
 	if err != nil {
-		logf("ERROR", "action=allow reason=server_unreachable elapsed=%.1fs session=%s err=%v",
-			time.Since(start).Seconds(), hook.SessionID, err)
+		logf("ERROR", "action=allow reason=server_unreachable session=%s err=%v", hook.SessionID, err)
 		fmt.Println(allowJSON())
 		return
 	}
-	logf("DEBUG", "review response bytes=%d elapsed=%.1fs session=%s",
-		len(respBody), time.Since(start).Seconds(), hook.SessionID)
 
 	var resp reviewResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
@@ -762,24 +463,19 @@ func handleReviewPlan(input []byte) {
 		return
 	}
 
-	// Poll until the work item completes (only happens on first review when
-	// there's no persisted state — follow-up reviews are synchronous).
 	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
 		if time.Now().After(deadline) {
-			logf("WARN", "action=allow reason=poll_timeout polls=%d elapsed=%.1fs session=%s task=%s",
-				pendingCount, time.Since(start).Seconds(), hook.SessionID, resp.TaskID)
+			logf("WARN", "action=allow reason=poll_timeout polls=%d session=%s", pendingCount, hook.SessionID)
 			fmt.Println(allowJSON())
 			return
 		}
-		logf("INFO", "poll pending task=%s count=%d elapsed=%.1fs remaining=%.1fs session=%s",
-			resp.TaskID, pendingCount, time.Since(start).Seconds(), time.Until(deadline).Seconds(), hook.SessionID)
-		time.Sleep(pollInterval)
+		logf("INFO", "poll task=%s count=%d elapsed=%.1fs session=%s",
+			resp.TaskID, pendingCount, time.Since(start).Seconds(), hook.SessionID)
+		time.Sleep(3 * time.Second)
 
-		pollBody := pollRequest{SessionID: hook.SessionID, TaskID: resp.TaskID}
-		respBody, err = postJSON(serverURL+"/Hooks/PollReview", token, pollBody)
+		respBody, err = postJSON(getServerURL()+"/Hooks/PollReview", token, pollRequest{hook.SessionID, resp.TaskID})
 		if err != nil {
-			logf("ERROR", "action=allow reason=server_unreachable_on_poll elapsed=%.1fs session=%s err=%v",
-				time.Since(start).Seconds(), hook.SessionID, err)
+			logf("ERROR", "action=allow reason=poll_unreachable session=%s err=%v", hook.SessionID, err)
 			fmt.Println(allowJSON())
 			return
 		}
@@ -791,114 +487,79 @@ func handleReviewPlan(input []byte) {
 		}
 	}
 
-	// Log the final verdict details before acting on it.
-	mustCount, optCount := 0, 0
+	mustCount := 0
 	if resp.SessionState != nil {
 		mustCount = len(resp.SessionState.Must)
-		optCount = len(resp.SessionState.Optional)
 	}
-	logf("INFO", "verdict approved=%t reason_chars=%d must=%d optional=%d review_count=%d elapsed=%.1fs session=%s",
-		resp.Approved, len(resp.Reason), mustCount, optCount,
-		func() int {
-			if resp.SessionState != nil {
-				return resp.SessionState.ReviewCount
-			}
-			return 0
-		}(),
-		time.Since(start).Seconds(), hook.SessionID)
+	logf("INFO", "verdict approved=%t must=%d elapsed=%.1fs session=%s",
+		resp.Approved, mustCount, time.Since(start).Seconds(), hook.SessionID)
 
-	// Persist or clear sessionState for the next hook invocation.
 	if resp.Approved {
 		clearSessionState(hook.SessionID)
-		clearRequirementsFile(planFilePath, hook.SessionID)
-		_ = os.Remove(skipsFilePath(planFilePath, hook.SessionID))
-		logf("INFO", "action=allow reason=approved session_state_cleared sidecar_cleared elapsed=%.1fs session=%s",
-			time.Since(start).Seconds(), hook.SessionID)
+		clearSidecarFiles(planFilePath, hook.SessionID)
+		logf("INFO", "action=allow reason=approved session=%s", hook.SessionID)
 		fmt.Println(allowJSON())
-	} else {
-		// Persist state: keep Must from the first classification (persisted or
-		// newly received), only update ReviewCount.
-		if resp.SessionState != nil {
-			stateToSave := resp.SessionState
-			if persisted != nil {
-				// Keep original Must/Optional + CodingPlanId, only take updated ReviewCount.
-				// CodingPlanId MUST be preserved across rounds so the server can write
-				// the final Approved/Denied status on the correct coding_plan row.
-				stateToSave = &sessionState{
-					CodingPlanId: persisted.CodingPlanId,
-					Must:         persisted.Must,
-					Optional:     persisted.Optional,
-					ReviewCount:  resp.SessionState.ReviewCount,
-				}
-				logf("DEBUG", "preserving original must=%d optional=%d coding_plan_id=%s from persisted state session=%s",
-					len(persisted.Must), len(persisted.Optional), persisted.CodingPlanId, hook.SessionID)
-			}
-			// Record this round's plan + deny reason so the next invocation can
-			// short-circuit if the agent resubmits the same plan verbatim.
-			stateToSave.LastPlan = plan
-			stateToSave.LastDenyReason = resp.Reason
-			saveSessionState(hook.SessionID, stateToSave)
-			logf("INFO", "persisted session_state path=%s review_count=%d must=%d session=%s",
-				sessionStatePath(hook.SessionID), stateToSave.ReviewCount, len(stateToSave.Must), hook.SessionID)
-		} else {
-			logf("WARN", "deny response had no sessionState — subsequent reviews will restart session=%s", hook.SessionID)
-		}
-		// Write the deny reason (requirements + skip instructions) next to the
-		// plan file so the agent can reference it reliably on the next pass —
-		// more robust than hoping [SKIP:N] markers survive a plan rewrite.
-		sidecar := requirementsFilePath(planFilePath, hook.SessionID)
-		writeRequirementsFile(planFilePath, hook.SessionID, resp.Reason)
-		logf("INFO", "sidecar_written path=%s bytes=%d session=%s",
-			sidecar, len(resp.Reason), hook.SessionID)
-		logf("INFO", "action=deny reason_chars=%d elapsed=%.1fs session=%s",
-			len(resp.Reason), time.Since(start).Seconds(), hook.SessionID)
-		fmt.Println(denyJSON(resp.Reason))
+		return
 	}
+
+	if resp.SessionState != nil {
+		stateToSave := resp.SessionState
+		if persisted != nil {
+			stateToSave = &sessionState{
+				CodingPlanId: persisted.CodingPlanId,
+				Must:         persisted.Must,
+				Optional:     persisted.Optional,
+				ReviewCount:  resp.SessionState.ReviewCount,
+			}
+		}
+		stateToSave.LastPlan = plan
+		stateToSave.LastDenyReason = resp.Reason
+		saveSessionState(hook.SessionID, stateToSave)
+	} else {
+		logf("WARN", "deny had no sessionState session=%s", hook.SessionID)
+	}
+	writeRequirementsFile(planFilePath, hook.SessionID, resp.Reason)
+	logf("INFO", "action=deny reason_chars=%d elapsed=%.1fs session=%s",
+		len(resp.Reason), time.Since(start).Seconds(), hook.SessionID)
+	fmt.Println(denyJSON(resp.Reason))
 }
 
-// handleLogPrompt is called when Claude Code fires the UserPromptSubmit hook.
-// It forwards the prompt to the Clover server for audit logging. This call is
-// fire-and-forget — failures are logged but never surface to the developer.
 func handleLogPrompt(input []byte) {
-	// Log all CLAUDE_PLUGIN_* env vars at debug level to help with configuration issues.
 	for _, env := range os.Environ() {
 		if strings.HasPrefix(env, "CLAUDE_PLUGIN") {
-			logMsg(fmt.Sprintf("env: %s", env))
+			logf("DEBUG", "env: %s", env)
 		}
 	}
-
 	token, err := getAccessToken()
 	if err != nil {
-		logMsg(fmt.Sprintf("log-prompt: auth failed: %v", err))
+		logf("WARN", "log-prompt: auth failed: %v", err)
 		return
 	}
-
-	serverURL := getServerURL()
-
 	var raw map[string]interface{}
 	if err := json.Unmarshal(input, &raw); err != nil {
-		logMsg(fmt.Sprintf("log-prompt: parse error: %v", err))
+		logf("WARN", "log-prompt: parse error: %v", err)
 		return
 	}
-
 	cwd, _ := raw["cwd"].(string)
 	if cwd == "" {
 		cwd = "."
 	}
-
 	prompt := fmt.Sprintf("%v", raw["prompt"])
-	body := logPromptRequest{
+	body := struct {
+		Prompt string `json:"prompt"`
+		User   string `json:"user"`
+		Email  string `json:"email"`
+		Repo   string `json:"repo"`
+		Branch string `json:"branch"`
+	}{
 		Prompt: prompt,
 		User:   gitCmd(cwd, "config", "user.name"),
 		Email:  getClaudeEmail(),
 		Repo:   filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
 		Branch: gitCmd(cwd, "branch", "--show-current"),
 	}
-
-	logMsg(fmt.Sprintf("log-prompt: %dchars → %s", len(prompt), serverURL))
-	_, err = postJSON(serverURL+"/Hooks/LogPrompt", token, body)
-	if err != nil {
-		logMsg(fmt.Sprintf("log-prompt: POST failed: %v", err))
+	if _, err := postJSON(getServerURL()+"/Hooks/LogPrompt", token, body); err != nil {
+		logf("WARN", "log-prompt: POST failed: %v", err)
 	}
 }
 
@@ -906,23 +567,16 @@ func handleLogPrompt(input []byte) {
 // Entry point
 // =============================================================================
 
-// main reads the hook event from stdin and dispatches to the appropriate
-// handler based on the command-line argument:
-//
-//	clover-hook review-plan   — called on ExitPlanMode (PreToolUse)
-//	clover-hook log-prompt    — called on UserPromptSubmit
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: clover-hook <review-plan|log-prompt>")
 		os.Exit(1)
 	}
-
 	input, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to read stdin:", err)
 		os.Exit(1)
 	}
-
 	switch os.Args[1] {
 	case "review-plan":
 		handleReviewPlan(input)
