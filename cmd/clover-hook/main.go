@@ -260,12 +260,24 @@ type sessionState struct {
 	ReviewCount    int      `json:"reviewCount"`
 }
 
-// parseSkipLines extracts every [SKIP:N — reason] marker from the plan text,
-// regardless of whether it sits on its own line or inline inside a bullet or
-// sentence. The server is responsible for parsing the index and reason — the
+// parseSkipLinesFromSidecar reads the sidecar requirements file and extracts
+// every [SKIP:N — reason] marker from it. The agent is instructed to write
+// skip decisions into the sidecar file (not the plan text), so the plan stays
+// clean. The server is responsible for parsing the index and reason — the
 // plugin just forwards the raw marker strings.
-func parseSkipLines(plan string) []string {
-	matches := skipMarkerRegex.FindAllString(plan, -1)
+//
+// Returns nil if the sidecar doesn't exist or contains no skip markers.
+func parseSkipLinesFromSidecar(planFile, sessionId string) []string {
+	sidecar := requirementsFilePath(planFile, sessionId)
+	data, err := os.ReadFile(sidecar)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logf("WARN", "skip read: sidecar read failed path=%s err=%v", sidecar, err)
+		}
+		return nil
+	}
+	logf("DEBUG", "skip read: sidecar=%s bytes=%d", sidecar, len(data))
+	matches := skipMarkerRegex.FindAllString(string(data), -1)
 	if matches == nil {
 		return nil
 	}
@@ -701,7 +713,7 @@ func handleReviewPlan(input []byte) {
 			return
 		}
 
-		skipLines := parseSkipLines(plan)
+		skipLines := parseSkipLinesFromSidecar(planFilePath, hook.SessionID)
 		logf("INFO", "flow=judge persisted_state review_count=%d must=%d optional=%d skips_found=%d session=%s",
 			persisted.ReviewCount, len(persisted.Must), len(persisted.Optional), len(skipLines), hook.SessionID)
 		for i, skip := range skipLines {
