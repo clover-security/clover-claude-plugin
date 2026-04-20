@@ -260,23 +260,22 @@ type sessionState struct {
 	ReviewCount    int      `json:"reviewCount"`
 }
 
-// parseSkipLinesFromSidecar reads the sidecar requirements file and extracts
-// every [SKIP:N — reason] marker from it. The agent is instructed to write
-// skip decisions into the sidecar file (not the plan text), so the plan stays
-// clean. The server is responsible for parsing the index and reason — the
-// plugin just forwards the raw marker strings.
+// parseSkipLinesFromSidecar reads the dedicated skips file and extracts every
+// [SKIP:N — reason] marker from it. The agent writes skip decisions to
+// {plan-stem}.clover-skips.md — a file separate from the requirements file —
+// so it cannot accidentally overwrite the requirements while adding skips.
 //
-// Returns nil if the sidecar doesn't exist or contains no skip markers.
+// Returns nil if the skips file doesn't exist or contains no markers.
 func parseSkipLinesFromSidecar(planFile, sessionId string) []string {
-	sidecar := requirementsFilePath(planFile, sessionId)
-	data, err := os.ReadFile(sidecar)
+	path := skipsFilePath(planFile, sessionId)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			logf("WARN", "skip read: sidecar read failed path=%s err=%v", sidecar, err)
+			logf("WARN", "skip read: file read failed path=%s err=%v", path, err)
 		}
 		return nil
 	}
-	logf("DEBUG", "skip read: sidecar=%s bytes=%d", sidecar, len(data))
+	logf("DEBUG", "skip read: path=%s bytes=%d", path, len(data))
 	matches := skipMarkerRegex.FindAllString(string(data), -1)
 	if matches == nil {
 		return nil
@@ -577,24 +576,37 @@ func findPlanFile(plan string) string {
 	return ""
 }
 
-// requirementsFilePath returns the path of the sidecar requirements file
-// written next to the agent's plan file. When the plan is at
-// /path/to/plan.md, the requirements go to /path/to/plan.clover-requirements.md.
-// If the plan file is unknown we fall back to $CLAUDE_PLUGIN_DATA so the file
-// still persists across hook invocations keyed by sessionId.
-func requirementsFilePath(planFile, sessionId string) string {
+// sidecarPath builds a path in the same directory as the plan file, with a
+// given suffix. Falls back to $CLAUDE_PLUGIN_DATA (or os.TempDir) when the
+// plan file path is unknown, keyed by sessionId.
+func sidecarPath(planFile, sessionId, suffix string) string {
 	if planFile != "" {
 		dir := filepath.Dir(planFile)
 		base := filepath.Base(planFile)
 		ext := filepath.Ext(base)
 		stem := strings.TrimSuffix(base, ext)
-		return filepath.Join(dir, stem+".clover-requirements.md")
+		return filepath.Join(dir, stem+suffix)
 	}
 	dataDir := getEnv("CLAUDE_PLUGIN_DATA")
 	if dataDir == "" {
 		dataDir = os.TempDir()
 	}
-	return filepath.Join(dataDir, "clover-requirements-"+sessionId+".md")
+	return filepath.Join(dataDir, "clover-"+sessionId+suffix)
+}
+
+// requirementsFilePath returns the path of the requirements sidecar written
+// by the plugin on deny. The agent reads this file to see what to address.
+// It must NOT edit or delete it — skip decisions go to the skips file.
+func requirementsFilePath(planFile, sessionId string) string {
+	return sidecarPath(planFile, sessionId, ".clover-requirements.md")
+}
+
+// skipsFilePath returns the path of the skips sidecar. The agent writes
+// [SKIP:N — reason] lines here when it wants to skip a requirement.
+// Separate from the requirements file so the agent can't accidentally
+// overwrite the requirements while adding skips.
+func skipsFilePath(planFile, sessionId string) string {
+	return sidecarPath(planFile, sessionId, ".clover-skips.md")
 }
 
 // writeRequirementsFile persists the deny reason (which contains the MUST
@@ -799,6 +811,7 @@ func handleReviewPlan(input []byte) {
 	if resp.Approved {
 		clearSessionState(hook.SessionID)
 		clearRequirementsFile(planFilePath, hook.SessionID)
+		_ = os.Remove(skipsFilePath(planFilePath, hook.SessionID))
 		logf("INFO", "action=allow reason=approved session_state_cleared sidecar_cleared elapsed=%.1fs session=%s",
 			time.Since(start).Seconds(), hook.SessionID)
 		fmt.Println(allowJSON())
