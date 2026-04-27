@@ -32,6 +32,11 @@ cp scripts/run-hook.sh "$STAGE/scripts/"
 chmod +x "$STAGE/scripts/run-hook.sh"
 cp README.md "$STAGE/"
 
+# Bundle skills (auto-discovered by Claude Code from skills/<name>/SKILL.md).
+if [ -d skills ]; then
+    cp -R skills "$STAGE/"
+fi
+
 # Bundle the four platform binaries from bin/. Source lives in a private
 # repo now; bin/ is treated as the canonical artifact location and is
 # kept in sync with the latest release.

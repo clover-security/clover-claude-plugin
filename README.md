@@ -43,6 +43,13 @@ export CLOVER_CLIENT_ID=your-client-id
 export CLOVER_CLIENT_SECRET=your-client-secret
 ```
 
+## Skills
+
+- **`/security-requirements <mode>`** — surface security requirements before implementation. Modes:
+  - `threat-questions` — short STRIDE-style questionnaire when designing a feature that touches auth, user input, sensitive data, network, or third-party APIs. Surfaces concerns before code is written and folds mitigations into the plan.
+
+  Also triggers proactively when a plan touches a sensitive area.
+
 ## Logs
 
 Debug logs at `/tmp/clover-hook.log`
