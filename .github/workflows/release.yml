@@ -8,48 +8,12 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - goos: darwin
-            goarch: arm64
-            name: clover-hook-darwin-arm64
-          - goos: darwin
-            goarch: amd64
-            name: clover-hook-darwin-amd64
-          - goos: linux
-            goarch: amd64
-            name: clover-hook-linux-amd64
-          - goos: linux
-            goarch: arm64
-            name: clover-hook-linux-arm64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-      - name: Build
-        run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w" -o ${{ matrix.name }} ./cmd/clover-hook/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
-
   release:
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
 
       - name: Get current version
         id: current
@@ -110,13 +74,13 @@ jobs:
             echo "version=${{ steps.current.outputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare binaries
+      - name: Verify binaries present
         run: |
-          mkdir -p release
-          for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            cp "$dir/$name" "release/$name"
-            chmod +x "release/$name"
+          for name in clover-hook-darwin-arm64 clover-hook-darwin-amd64 clover-hook-linux-amd64 clover-hook-linux-arm64; do
+            if [ ! -f "bin/$name" ]; then
+              echo "ERROR: bin/$name is missing — push binaries from the source repo before releasing" >&2
+              exit 1
+            fi
           done
 
       - name: Create tag and release
@@ -127,6 +91,6 @@ jobs:
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --generate-notes \
-            release/*
+            bin/clover-hook-*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

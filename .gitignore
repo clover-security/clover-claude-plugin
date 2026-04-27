@@ -1,3 +1,6 @@
 .DS_Store
 *.log
-bin/
+cmd/
+go.mod
+go.sum
+clover-hook
