@@ -4,18 +4,20 @@
 
 REPO="clover-security/clover-claude-plugin"
 
-# Always persist plugin options as a sourceable env file so hooks that fire
-# without CLAUDE_PLUGIN_OPTION_* env vars (e.g. UserPromptSubmit) can still
-# authenticate. Must happen before any early exit.
+# Persist plugin options to env.sh on every SessionStart so other hook
+# events (UserPromptSubmit, PreToolUse) — which do not receive
+# CLAUDE_PLUGIN_OPTION_* env vars — can read them via run-hook.sh.
+# printf %q quotes values safely for re-sourcing.
 if [ -n "${CLAUDE_PLUGIN_DATA}" ]; then
   mkdir -p "${CLAUDE_PLUGIN_DATA}"
-  cat > "${CLAUDE_PLUGIN_DATA}/env.sh" <<ENV
-export CLOVER_CLIENT_ID="${CLAUDE_PLUGIN_OPTION_CLIENT_ID}"
-export CLOVER_CLIENT_SECRET="${CLAUDE_PLUGIN_OPTION_CLIENT_SECRET}"
-export CLOVER_AUTH_URL="${CLAUDE_PLUGIN_OPTION_AUTH_URL}"
-export CLOVER_SERVER_URL="${CLAUDE_PLUGIN_OPTION_SERVER_URL}"
-ENV
-  chmod 600 "${CLAUDE_PLUGIN_DATA}/env.sh"
+  ENV_FILE="${CLAUDE_PLUGIN_DATA}/env.sh"
+  {
+    printf 'export CLOVER_CLIENT_ID=%q\n'     "${CLAUDE_PLUGIN_OPTION_CLIENT_ID:-}"
+    printf 'export CLOVER_CLIENT_SECRET=%q\n' "${CLAUDE_PLUGIN_OPTION_CLIENT_SECRET:-}"
+    printf 'export CLOVER_AUTH_URL=%q\n'      "${CLAUDE_PLUGIN_OPTION_AUTH_URL:-}"
+    printf 'export CLOVER_SERVER_URL=%q\n'    "${CLAUDE_PLUGIN_OPTION_SERVER_URL:-}"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 fi
 
 BINARY_DIR="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT}}/bin"

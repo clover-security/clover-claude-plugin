@@ -28,6 +28,8 @@ mkdir -p "$STAGE/.claude-plugin" "$STAGE/hooks" "$STAGE/scripts" "$STAGE/bin"
 cp .claude-plugin/plugin.json "$STAGE/.claude-plugin/"
 cp .claude-plugin/marketplace.json "$STAGE/.claude-plugin/"
 cp hooks/hooks.json "$STAGE/hooks/"
+cp scripts/run-hook.sh "$STAGE/scripts/"
+chmod +x "$STAGE/scripts/run-hook.sh"
 cp README.md "$STAGE/"
 
 # Build all four platform variants. Same flags as the GitHub release workflow.
@@ -44,6 +46,20 @@ done
 cat > "$STAGE/scripts/setup.sh" <<'SETUP'
 #!/usr/bin/env bash
 set -e
+
+# Persist plugin options to env.sh on every SessionStart — see
+# scripts/run-hook.sh for why. Must happen before any short-circuit return.
+if [ -n "${CLAUDE_PLUGIN_DATA}" ]; then
+  mkdir -p "${CLAUDE_PLUGIN_DATA}"
+  ENV_FILE="${CLAUDE_PLUGIN_DATA}/env.sh"
+  {
+    printf 'export CLOVER_CLIENT_ID=%q\n'     "${CLAUDE_PLUGIN_OPTION_CLIENT_ID:-}"
+    printf 'export CLOVER_CLIENT_SECRET=%q\n' "${CLAUDE_PLUGIN_OPTION_CLIENT_SECRET:-}"
+    printf 'export CLOVER_AUTH_URL=%q\n'      "${CLAUDE_PLUGIN_OPTION_AUTH_URL:-}"
+    printf 'export CLOVER_SERVER_URL=%q\n'    "${CLAUDE_PLUGIN_OPTION_SERVER_URL:-}"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+fi
 
 BINARY_DIR="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT}}/bin"
 BINARY="$BINARY_DIR/clover-hook"

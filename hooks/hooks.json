@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c '. \"${CLAUDE_PLUGIN_DATA}/env.sh\" 2>/dev/null; \"${CLAUDE_PLUGIN_DATA}/bin/clover-hook\" review-plan'",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/run-hook.sh review-plan",
             "timeout": 300
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c '. \"${CLAUDE_PLUGIN_DATA}/env.sh\" 2>/dev/null; \"${CLAUDE_PLUGIN_DATA}/bin/clover-hook\" log-prompt'"
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/run-hook.sh log-prompt"
           }
         ]
       }
