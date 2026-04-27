@@ -13,12 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// skipMarkerRegex matches [SKIP:N — reason] anywhere in text.
-var skipMarkerRegex = regexp.MustCompile(`\[SKIP:\s*\d+[^\]]*\]`)
+// skipMarkerRegex matches [SKIP:N — reason] anywhere in text and captures the
+// integer id (group 1) and the free-form reason (group 2, optional).
+var skipMarkerRegex = regexp.MustCompile(`\[SKIP:\s*(\d+)(?:\s*(?:[—\-–]|--)\s*([^\]]*?))?\s*\]`)
 
 const logFile = "/tmp/clover-hook.log"
 
@@ -113,8 +115,6 @@ func getAccessToken() (string, error) {
 type hookInput struct {
 	SessionID string    `json:"session_id"`
 	CWD       string    `json:"cwd"`
-	HookEvent string    `json:"hook_event_name"`
-	ToolName  string    `json:"tool_name"`
 	ToolInput toolInput `json:"tool_input"`
 }
 
@@ -123,32 +123,76 @@ type toolInput struct {
 	PlanFilePath string `json:"planFilePath"` // may be absent; we fall back to findPlanFile
 }
 
+// clientRequirement mirrors the server's HookClientRequirement — a requirement
+// carried alongside its stable PlanSessionRequirementId (the integer the user
+// writes as [SKIP:N] in the skips file).
+type clientRequirement struct {
+	PlanSessionRequirementID int    `json:"planSessionRequirementId"`
+	Requirement              string `json:"requirement"`
+}
+
+// skipRequirement mirrors the server's HookSkipRequirement — a typed skip
+// directive pairing a requirement's stable PlanSessionRequirementId with an
+// optional free-form reason.
+type skipRequirement struct {
+	PlanSessionRequirementID int    `json:"planSessionRequirementId"`
+	Reason                   string `json:"reason,omitempty"`
+}
+
 // sessionState is round-tripped verbatim between plugin invocations and the server.
 // LastPlan / LastDenyReason are plugin-local (server ignores them).
 type sessionState struct {
-	CodingPlanId   string   `json:"codingPlanId,omitempty"`
-	LastDenyReason string   `json:"lastDenyReason,omitempty"`
-	LastPlan       string   `json:"lastPlan,omitempty"`
-	Must           []string `json:"must"`
-	Optional       []string `json:"optional,omitempty"`
-	ReviewCount    int      `json:"reviewCount"`
+	CodingPlanId   string              `json:"codingPlanId,omitempty"`
+	LastDenyReason string              `json:"lastDenyReason,omitempty"`
+	LastPlan       string              `json:"lastPlan,omitempty"`
+	Must           []clientRequirement `json:"must"`
+	ReviewCount    int                 `json:"reviewCount"`
 }
 
+// baseRequest carries the session id shared by every /Hooks/* endpoint.
+// Go embeds this anonymously so the field flattens into the JSON body.
+// Mirrors the server's HooksControllerRequestBase.
+type baseRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+// planRequest is baseRequest + the plan text, shared by /Hooks/ReviewPlan and
+// /Hooks/JudgePlan. Mirrors the server's HooksControllerPlanRequestBase.
+type planRequest struct {
+	baseRequest
+	Plan string `json:"plan"`
+}
+
+// reviewRequest starts a fresh analysis — sent when no prior session state exists.
 type reviewRequest struct {
-	Plan         string        `json:"plan"`
-	PlanFile     string        `json:"planFile,omitempty"`
-	Repo         string        `json:"repo"`
-	Branch       string        `json:"branch"`
-	User         string        `json:"user"`
-	Email        string        `json:"email"`
-	SessionID    string        `json:"sessionId"`
-	SessionState *sessionState `json:"sessionState,omitempty"`
-	SkipLines    []string      `json:"skipLines,omitempty"`
+	planRequest
+	Branch     string `json:"branch,omitempty"`
+	Email      string `json:"email,omitempty"`
+	PlanFile   string `json:"planFile,omitempty"`
+	Repository string `json:"repository,omitempty"`
+}
+
+// judgeRequest re-evaluates an existing plan, applying any skipped requirements
+// the user collected since the last round.
+type judgeRequest struct {
+	planRequest
+	CodingPlanID     string            `json:"codingPlanId"`
+	SkipRequirements []skipRequirement `json:"skipRequirements,omitempty"`
 }
 
 type pollRequest struct {
-	SessionID string `json:"sessionId"`
-	TaskID    string `json:"taskId"`
+	baseRequest
+	TaskID string `json:"taskId"`
+}
+
+// logPromptRequest posts a user prompt submission for audit. Shares the git
+// context fields with reviewRequest.
+type logPromptRequest struct {
+	baseRequest
+	Branch     string `json:"branch,omitempty"`
+	Email      string `json:"email,omitempty"`
+	Prompt     string `json:"prompt"`
+	Repository string `json:"repository,omitempty"`
 }
 
 type reviewResponse struct {
@@ -156,6 +200,23 @@ type reviewResponse struct {
 	Reason       string        `json:"reason"`
 	SessionState *sessionState `json:"sessionState,omitempty"`
 	TaskID       string        `json:"taskId"`
+}
+
+// reviewResponseEnvelope mirrors the server's controller wrapper:
+// every /Hooks/* response comes back as { "result": HookReviewResultDto }.
+// Without this envelope the Go decode silently returns zero values for
+// every field — taskId in particular ends up "", which means the polling
+// loop never starts and the plugin falls through to a no-reason deny.
+type reviewResponseEnvelope struct {
+	Result reviewResponse `json:"result"`
+}
+
+func decodeReviewResponse(body []byte) (reviewResponse, error) {
+	var envelope reviewResponseEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return reviewResponse{}, err
+	}
+	return envelope.Result, nil
 }
 
 // =============================================================================
@@ -178,14 +239,23 @@ func getServerURL() string {
 	return "https://app.cloversec.io"
 }
 
+// getClaudeEmail reads the account email from ~/.claude.json (shared by the
+// Claude Code CLI and Desktop app). `claude auth status --json` no longer
+// exposes the email field as of CLI 2.x.
 func getClaudeEmail() string {
-	out, err := exec.Command("claude", "auth", "status", "--json").Output()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	var r struct{ Email string `json:"email"` }
-	json.Unmarshal(out, &r)
-	return r.Email
+	data, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		OauthAccount struct{ EmailAddress string `json:"emailAddress"` } `json:"oauthAccount"`
+	}
+	json.Unmarshal(data, &r)
+	return r.OauthAccount.EmailAddress
 }
 
 func gitCmd(dir string, args ...string) string {
@@ -196,6 +266,25 @@ func gitCmd(dir string, args ...string) string {
 		return "unknown"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// resolveRepositoryName returns the basename of the git toplevel (e.g. "leaf"
+// for /Users/x/Code/leaf), or "" when cwd isn't inside a git repo. Empty
+// triggers the `omitempty` JSON tag on the wire field, which is what the
+// server expects when it can't be determined — sending the literal "unknown"
+// would falsely match the default-application fallback path.
+func resolveRepositoryName(cwd string) string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = cwd
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	topLevel := strings.TrimSpace(string(out))
+	if topLevel == "" {
+		return ""
+	}
+	return filepath.Base(topLevel)
 }
 
 func httpClient() *http.Client {
@@ -317,6 +406,45 @@ func skipsFilePath(planFile, sessionId string) string {
 	return sidecarPath(planFile, sessionId, ".clover-skips.md")
 }
 
+// sessionIdSidecarPath stores the sessionId next to the plan file so it
+// survives Claude restarts (which mint a new ephemeral sessionId per process).
+// When this file exists next to a plan, we treat it as the canonical sessionId
+// for that plan and ignore the one Claude hands us.
+func sessionIdSidecarPath(planFile, sessionId string) string {
+	return sidecarPath(planFile, sessionId, ".clover-session.json")
+}
+
+type sessionIdSidecar struct {
+	SessionID string `json:"sessionId"`
+}
+
+func readSessionIdSidecar(planFile string) string {
+	if planFile == "" {
+		return ""
+	}
+	data, err := os.ReadFile(sessionIdSidecarPath(planFile, ""))
+	if err != nil {
+		return ""
+	}
+	var s sessionIdSidecar
+	if err := json.Unmarshal(data, &s); err != nil {
+		logf("WARN", "session_sidecar unmarshal failed err=%v", err)
+		return ""
+	}
+	return s.SessionID
+}
+
+func writeSessionIdSidecar(planFile, sessionId string) {
+	if planFile == "" || sessionId == "" {
+		return
+	}
+	path := sessionIdSidecarPath(planFile, sessionId)
+	data, _ := json.Marshal(sessionIdSidecar{SessionID: sessionId})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		logf("WARN", "session_sidecar write failed path=%s err=%v", path, err)
+	}
+}
+
 func writeRequirementsFile(planFile, sessionId, reason string) {
 	if err := os.WriteFile(requirementsFilePath(planFile, sessionId), []byte(reason+"\n"), 0600); err != nil {
 		logf("WARN", "requirements write failed err=%v", err)
@@ -326,22 +454,92 @@ func writeRequirementsFile(planFile, sessionId, reason string) {
 func clearSidecarFiles(planFile, sessionId string) {
 	os.Remove(requirementsFilePath(planFile, sessionId))
 	os.Remove(skipsFilePath(planFile, sessionId))
+	if planFile != "" {
+		os.Remove(sessionIdSidecarPath(planFile, sessionId))
+	}
 }
 
-// parseSkipLinesFromSidecar reads skip decisions from the dedicated skips file.
-// The agent writes [SKIP:N — reason] lines to {plan-stem}.clover-skips.md,
-// keeping the plan text and requirements file untouched.
-func parseSkipLinesFromSidecar(planFile, sessionId string) []string {
+// removeSkipRequirementsFile drops just the skips sidecar, keeping the
+// requirements file and the session pin in place. Called after the server
+// has confirmed it consumed the skip requirements — the entries are now
+// persisted as Skipped rows in the DB and re-sending them next round would
+// be wasteful and confusing if the user later wants to "unskip" something.
+func removeSkipRequirementsFile(planFile, sessionId string) {
+	path := skipsFilePath(planFile, sessionId)
+	err := os.Remove(path)
+	if err == nil {
+		logf("DEBUG", "skip_file removed after server ack path=%s", path)
+		return
+	}
+	if !os.IsNotExist(err) {
+		logf("WARN", "skip_file remove failed path=%s err=%v", path, err)
+	}
+}
+
+// parseSkipRequirementsFromSidecar reads skip decisions from the dedicated
+// skips file and returns them as typed skipRequirement objects. The agent
+// writes [SKIP:N — reason] lines to {plan-stem}.clover-skips.md; we parse the
+// index and (optional) reason here so the server never has to do regex on user
+// input.
+func parseSkipRequirementsFromSidecar(planFile, sessionId string) []skipRequirement {
 	data, err := os.ReadFile(skipsFilePath(planFile, sessionId))
 	if err != nil {
 		return nil
 	}
-	return skipMarkerRegex.FindAllString(string(data), -1)
+
+	matches := skipMarkerRegex.FindAllStringSubmatch(string(data), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	seen := make(map[int]bool, len(matches))
+	skipRequirements := make([]skipRequirement, 0, len(matches))
+	for _, match := range matches {
+		id, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		reason := ""
+		if len(match) > 2 {
+			reason = strings.TrimSpace(match[2])
+		}
+		skipRequirements = append(skipRequirements, skipRequirement{PlanSessionRequirementID: id, Reason: reason})
+	}
+	return skipRequirements
+}
+
+// normalizePlanContent collapses whitespace differences that defeat exact
+// matching between Claude's in-memory plan and the on-disk file (line ending
+// variations, trailing newlines, leading/trailing space).
+func normalizePlanContent(content string) string {
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	return strings.TrimSpace(normalized)
+}
+
+// firstNonEmptyLine returns the first non-blank line of the input, trimmed.
+// Used as a coarse plan-identity check: most plans start with a "# Title"
+// line that survives in-place edits to the body.
+func firstNonEmptyLine(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // findPlanFile discovers the plan's on-disk path by scanning ~/.claude/plans/.
-// Prefers an exact content match; falls back to the most-recently-modified
-// .md file if it was written within the last 60 seconds.
+// Strategy, in order:
+//  1. Exact normalized content match (whitespace-tolerant).
+//  2. First-line (plan title) match — survives mid-plan edits.
+//  3. Most-recently-modified .md within 5 minutes — survives slow user actions.
+// Returns "" only when every strategy fails (no recent .md files at all).
 func findPlanFile(plan string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -350,30 +548,60 @@ func findPlanFile(plan string) string {
 	plansDir := filepath.Join(home, ".claude", "plans")
 	entries, err := os.ReadDir(plansDir)
 	if err != nil {
+		logf("WARN", "plan_file plans_dir_unreadable path=%s err=%v", plansDir, err)
 		return ""
 	}
-	norm := strings.TrimSpace(plan)
+
+	normPlan := normalizePlanContent(plan)
+	planFirstLine := firstNonEmptyLine(normPlan)
+
+	var titleMatchPath string
 	var latestInfo os.FileInfo
 	var latestPath string
+
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
 		path := filepath.Join(plansDir, e.Name())
-		if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) == norm {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue
+		}
+		normFile := normalizePlanContent(string(data))
+
+		// Strategy 1: exact normalized match.
+		if normFile == normPlan {
 			logf("DEBUG", "plan_file content_match path=%s", path)
 			return path
 		}
-		if info, err := e.Info(); err == nil {
+
+		// Strategy 2: title (first non-empty line) match — keep as candidate.
+		if planFirstLine != "" && titleMatchPath == "" && firstNonEmptyLine(normFile) == planFirstLine {
+			titleMatchPath = path
+		}
+
+		// Strategy 3: track most-recent .md for the mtime fallback.
+		if info, infoErr := e.Info(); infoErr == nil {
 			if latestInfo == nil || info.ModTime().After(latestInfo.ModTime()) {
 				latestInfo, latestPath = info, path
 			}
 		}
 	}
-	if latestInfo != nil && time.Since(latestInfo.ModTime()) < 60*time.Second {
-		logf("DEBUG", "plan_file mtime_fallback path=%s", latestPath)
+
+	if titleMatchPath != "" {
+		logf("DEBUG", "plan_file title_match path=%s", titleMatchPath)
+		return titleMatchPath
+	}
+
+	// Five-minute window covers slow user actions (re-reading the plan, browsing
+	// dependencies) without picking up a stale plan from a prior session.
+	if latestInfo != nil && time.Since(latestInfo.ModTime()) < 5*time.Minute {
+		logf("DEBUG", "plan_file mtime_fallback path=%s age=%s", latestPath, time.Since(latestInfo.ModTime()))
 		return latestPath
 	}
+
+	logf("WARN", "plan_file not_found scanned=%s", plansDir)
 	return ""
 }
 
@@ -396,18 +624,31 @@ func handleReviewPlan(input []byte) {
 	if planFilePath == "" {
 		planFilePath = findPlanFile(plan)
 	}
+
+	// If a sessionId sidecar exists next to the plan, it wins over the ephemeral
+	// sessionId Claude provides — so the same plan file resumes the same review
+	// session across Claude restarts.
+	sessionId := hook.SessionID
+	if persistedSessionId := readSessionIdSidecar(planFilePath); persistedSessionId != "" {
+		if persistedSessionId != sessionId {
+			logf("INFO", "session_sidecar override claude_session=%s persisted_session=%s plan_file=%q",
+				sessionId, persistedSessionId, planFilePath)
+		}
+		sessionId = persistedSessionId
+	}
+
 	logf("INFO", "session=%s plan_chars=%d plan_file=%q cwd=%q",
-		hook.SessionID, len(plan), planFilePath, hook.CWD)
+		sessionId, len(plan), planFilePath, hook.CWD)
 
 	if plan == "" {
-		logf("INFO", "action=allow reason=empty_plan session=%s", hook.SessionID)
+		logf("INFO", "action=allow reason=empty_plan session=%s", sessionId)
 		fmt.Println(allowJSON())
 		return
 	}
 
 	token, err := getAccessToken()
 	if err != nil {
-		logf("ERROR", "action=allow reason=auth_failed session=%s err=%v", hook.SessionID, err)
+		logf("ERROR", "action=allow reason=auth_failed session=%s err=%v", sessionId, err)
 		fmt.Println(allowJSON())
 		return
 	}
@@ -417,71 +658,101 @@ func handleReviewPlan(input []byte) {
 		cwd = "."
 	}
 
-	req := reviewRequest{
-		Plan:      plan,
-		PlanFile:  planFilePath,
-		Repo:      filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
-		Branch:    gitCmd(cwd, "branch", "--show-current"),
-		User:      gitCmd(cwd, "config", "user.name"),
-		Email:     getClaudeEmail(),
-		SessionID: hook.SessionID,
-	}
-	logf("INFO", "git repo=%q branch=%q user=%q session=%s", req.Repo, req.Branch, req.User, hook.SessionID)
-
-	persisted := loadSessionState(hook.SessionID)
-
-	if persisted != nil {
-		// Same plan as last deny — no point calling server again.
-		if persisted.LastPlan == plan && persisted.LastDenyReason != "" {
-			logf("INFO", "short_circuit plan_unchanged review_count=%d session=%s", persisted.ReviewCount, hook.SessionID)
-			fmt.Println(denyJSON(persisted.LastDenyReason))
-			return
-		}
-		skipLines := parseSkipLinesFromSidecar(planFilePath, hook.SessionID)
-		logf("INFO", "flow=judge review_count=%d must=%d skips=%d session=%s",
-			persisted.ReviewCount, len(persisted.Must), len(skipLines), hook.SessionID)
-		req.SessionState = persisted
-		req.SkipLines = skipLines
-	} else {
-		logf("INFO", "flow=start session=%s", hook.SessionID)
-	}
+	persisted := loadSessionState(sessionId)
 
 	start := time.Now()
 	deadline := start.Add(3 * time.Minute)
 
-	respBody, err := postJSON(getServerURL()+"/Hooks/ReviewPlan", token, req)
-	if err != nil {
-		logf("ERROR", "action=allow reason=server_unreachable session=%s err=%v", hook.SessionID, err)
+	// Two endpoints, picked based on whether we already have a server-side plan:
+	//   - No persisted state  → /Hooks/ReviewPlan  (starts analysis, returns taskId)
+	//   - Persisted state     → /Hooks/JudgePlan   (re-evaluates with skips)
+	var respBody []byte
+	var postErr error
+	// Track whether the current request actually carried skip requirements to
+	// the server. If it did and the server acks, we drop the local sidecar
+	// below so the user's `[SKIP:N]` markers are not re-sent on the next round
+	// (the server already persisted them as Skipped rows in the DB).
+	sentSkipRequirements := false
+	if persisted != nil && persisted.CodingPlanId != "" {
+		skipRequirements := parseSkipRequirementsFromSidecar(planFilePath, sessionId)
+
+		// Short-circuit only when nothing has changed — same plan, no new skips.
+		// If the user added a [SKIP:N] marker we still need to call the server
+		// so it can re-evaluate with the new skip list.
+		if persisted.LastPlan == plan && persisted.LastDenyReason != "" && len(skipRequirements) == 0 {
+			logf("INFO", "short_circuit plan_unchanged review_count=%d session=%s", persisted.ReviewCount, sessionId)
+			fmt.Println(denyJSON(persisted.LastDenyReason))
+			return
+		}
+		logf("INFO", "flow=judge review_count=%d must=%d skip_requirements=%d session=%s",
+			persisted.ReviewCount, len(persisted.Must), len(skipRequirements), sessionId)
+
+		sentSkipRequirements = len(skipRequirements) > 0
+
+		respBody, postErr = postJSON(getServerURL()+"/Hooks/JudgePlan", token, judgeRequest{
+			planRequest:      planRequest{baseRequest: baseRequest{SessionID: sessionId}, Plan: plan},
+			CodingPlanID:     persisted.CodingPlanId,
+			SkipRequirements: skipRequirements,
+		})
+	} else {
+		logf("INFO", "flow=start session=%s", sessionId)
+
+		respBody, postErr = postJSON(getServerURL()+"/Hooks/ReviewPlan", token, reviewRequest{
+			planRequest: planRequest{baseRequest: baseRequest{SessionID: sessionId}, Plan: plan},
+			Branch:      gitCmd(cwd, "branch", "--show-current"),
+			Email:       getClaudeEmail(),
+			PlanFile:    planFilePath,
+			Repository:  resolveRepositoryName(cwd),
+		})
+	}
+	if postErr != nil {
+		logf("ERROR", "action=allow reason=server_unreachable session=%s err=%v", sessionId, postErr)
 		fmt.Println(allowJSON())
 		return
 	}
 
-	var resp reviewResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		logf("ERROR", "action=allow reason=bad_response session=%s err=%v", hook.SessionID, err)
+	resp, err := decodeReviewResponse(respBody)
+	if err != nil {
+		logf("ERROR", "action=allow reason=bad_response session=%s err=%v", sessionId, err)
 		fmt.Println(allowJSON())
 		return
 	}
+
+	// Server acknowledged the request — the skip requirements we sent are now
+	// persisted server-side as Skipped rows. Drop the local sidecar so the next
+	// hook round doesn't re-submit the same entries (the user can still write
+	// new [SKIP:N] markers; only the consumed ones go away).
+	if sentSkipRequirements {
+		removeSkipRequirementsFile(planFilePath, sessionId)
+	}
+
+	// As soon as the server has acknowledged this plan (with a taskId or final
+	// verdict), pin the sessionId to the plan file so a future Claude restart
+	// reuses the same server-side CodingPlan.
+	writeSessionIdSidecar(planFilePath, sessionId)
 
 	for pendingCount := 0; resp.TaskID != ""; pendingCount++ {
 		if time.Now().After(deadline) {
-			logf("WARN", "action=allow reason=poll_timeout polls=%d session=%s", pendingCount, hook.SessionID)
+			logf("WARN", "action=allow reason=poll_timeout polls=%d session=%s", pendingCount, sessionId)
 			fmt.Println(allowJSON())
 			return
 		}
 		logf("INFO", "poll task=%s count=%d elapsed=%.1fs session=%s",
-			resp.TaskID, pendingCount, time.Since(start).Seconds(), hook.SessionID)
+			resp.TaskID, pendingCount, time.Since(start).Seconds(), sessionId)
 		time.Sleep(3 * time.Second)
 
-		respBody, err = postJSON(getServerURL()+"/Hooks/PollReview", token, pollRequest{hook.SessionID, resp.TaskID})
+		respBody, err = postJSON(getServerURL()+"/Hooks/PollReview", token, pollRequest{
+			baseRequest: baseRequest{SessionID: sessionId},
+			TaskID:      resp.TaskID,
+		})
 		if err != nil {
-			logf("ERROR", "action=allow reason=poll_unreachable session=%s err=%v", hook.SessionID, err)
+			logf("ERROR", "action=allow reason=poll_unreachable session=%s err=%v", sessionId, err)
 			fmt.Println(allowJSON())
 			return
 		}
-		resp = reviewResponse{}
-		if err := json.Unmarshal(respBody, &resp); err != nil {
-			logf("ERROR", "action=allow reason=bad_poll_response session=%s err=%v", hook.SessionID, err)
+		resp, err = decodeReviewResponse(respBody)
+		if err != nil {
+			logf("ERROR", "action=allow reason=bad_poll_response session=%s err=%v", sessionId, err)
 			fmt.Println(allowJSON())
 			return
 		}
@@ -492,74 +763,65 @@ func handleReviewPlan(input []byte) {
 		mustCount = len(resp.SessionState.Must)
 	}
 	logf("INFO", "verdict approved=%t must=%d elapsed=%.1fs session=%s",
-		resp.Approved, mustCount, time.Since(start).Seconds(), hook.SessionID)
+		resp.Approved, mustCount, time.Since(start).Seconds(), sessionId)
 
 	if resp.Approved {
-		clearSessionState(hook.SessionID)
-		clearSidecarFiles(planFilePath, hook.SessionID)
-		logf("INFO", "action=allow reason=approved session=%s", hook.SessionID)
+		clearSessionState(sessionId)
+		clearSidecarFiles(planFilePath, sessionId)
+		logf("INFO", "action=allow reason=approved session=%s", sessionId)
 		fmt.Println(allowJSON())
 		return
 	}
 
 	if resp.SessionState != nil {
+		// The server is authoritative for Must — it already reflects skips and
+		// mitigations applied this round. Persist what the server sent plus our
+		// local-only cache fields.
 		stateToSave := resp.SessionState
-		if persisted != nil {
-			stateToSave = &sessionState{
-				CodingPlanId: persisted.CodingPlanId,
-				Must:         persisted.Must,
-				Optional:     persisted.Optional,
-				ReviewCount:  resp.SessionState.ReviewCount,
-			}
-		}
 		stateToSave.LastPlan = plan
 		stateToSave.LastDenyReason = resp.Reason
-		saveSessionState(hook.SessionID, stateToSave)
+		saveSessionState(sessionId, stateToSave)
 	} else {
-		logf("WARN", "deny had no sessionState session=%s", hook.SessionID)
+		logf("WARN", "deny had no sessionState session=%s", sessionId)
 	}
-	writeRequirementsFile(planFilePath, hook.SessionID, resp.Reason)
+	writeRequirementsFile(planFilePath, sessionId, resp.Reason)
 	logf("INFO", "action=deny reason_chars=%d elapsed=%.1fs session=%s",
-		len(resp.Reason), time.Since(start).Seconds(), hook.SessionID)
+		len(resp.Reason), time.Since(start).Seconds(), sessionId)
 	fmt.Println(denyJSON(resp.Reason))
 }
 
+// logPromptInput is the shape Claude passes to the UserPromptSubmit hook on
+// stdin. We only extract the fields we forward to the server.
+type logPromptInput struct {
+	CWD       string `json:"cwd"`
+	Prompt    string `json:"prompt"`
+	SessionID string `json:"session_id"`
+}
+
 func handleLogPrompt(input []byte) {
-	for _, env := range os.Environ() {
-		if strings.HasPrefix(env, "CLAUDE_PLUGIN") {
-			logf("DEBUG", "env: %s", env)
-		}
-	}
 	token, err := getAccessToken()
 	if err != nil {
 		logf("WARN", "log-prompt: auth failed: %v", err)
 		return
 	}
-	var raw map[string]interface{}
-	if err := json.Unmarshal(input, &raw); err != nil {
+	var hook logPromptInput
+	if err := json.Unmarshal(input, &hook); err != nil {
 		logf("WARN", "log-prompt: parse error: %v", err)
 		return
 	}
-	cwd, _ := raw["cwd"].(string)
+	cwd := hook.CWD
 	if cwd == "" {
 		cwd = "."
 	}
-	prompt := fmt.Sprintf("%v", raw["prompt"])
-	body := struct {
-		Prompt string `json:"prompt"`
-		User   string `json:"user"`
-		Email  string `json:"email"`
-		Repo   string `json:"repo"`
-		Branch string `json:"branch"`
-	}{
-		Prompt: prompt,
-		User:   gitCmd(cwd, "config", "user.name"),
-		Email:  getClaudeEmail(),
-		Repo:   filepath.Base(gitCmd(cwd, "rev-parse", "--show-toplevel")),
-		Branch: gitCmd(cwd, "branch", "--show-current"),
+	body := logPromptRequest{
+		baseRequest: baseRequest{SessionID: hook.SessionID},
+		Branch:      gitCmd(cwd, "branch", "--show-current"),
+		Email:       getClaudeEmail(),
+		Prompt:      hook.Prompt,
+		Repository:  resolveRepositoryName(cwd),
 	}
 	if _, err := postJSON(getServerURL()+"/Hooks/LogPrompt", token, body); err != nil {
-		logf("WARN", "log-prompt: POST failed: %v", err)
+		logf("WARN", "log-prompt: POST failed session=%s err=%v", hook.SessionID, err)
 	}
 }
 
