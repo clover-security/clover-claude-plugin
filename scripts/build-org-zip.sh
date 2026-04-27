@@ -32,13 +32,18 @@ cp scripts/run-hook.sh "$STAGE/scripts/"
 chmod +x "$STAGE/scripts/run-hook.sh"
 cp README.md "$STAGE/"
 
-# Build all four platform variants. Same flags as the GitHub release workflow.
-for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
-    GOOS="${target%/*}"
-    GOARCH="${target#*/}"
-    OUT="$STAGE/bin/clover-hook-${GOOS}-${GOARCH}"
-    echo "  building ${OUT}"
-    GOOS="$GOOS" GOARCH="$GOARCH" go build -ldflags="-s -w" -o "$OUT" ./cmd/clover-hook
+# Bundle the four platform binaries from bin/. Source lives in a private
+# repo now; bin/ is treated as the canonical artifact location and is
+# kept in sync with the latest release.
+for target in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+    SRC="bin/clover-hook-${target}"
+    if [ ! -f "$SRC" ]; then
+        echo "ERROR: ${SRC} is missing — pull binaries from the latest release first:" >&2
+        echo "  gh release download v${VERSION} --repo clover-security/clover-claude-plugin --dir bin/ --clobber --pattern 'clover-hook-*'" >&2
+        exit 1
+    fi
+    cp "$SRC" "$STAGE/bin/"
+    echo "  bundled ${target}"
 done
 
 # Setup script: at SessionStart, detect OS/arch and copy the matching bundled
