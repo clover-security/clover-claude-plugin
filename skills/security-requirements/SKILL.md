@@ -1,94 +1,79 @@
 ---
 name: security-requirements
-description: Surface security requirements before implementation. Dispatches to a sub-mode based on the argument. Currently supports `threat-questions` (STRIDE-style threat-modeling questionnaire). Trigger when the user runs `/security-requirements <mode>`, or proactively when designing a feature that touches authentication, authorization, user input, sensitive data (PII, secrets, tokens), network requests, file access, or third-party integrations. Also trigger on phrases like "threat model this", "security questions", "what could go wrong security-wise".
+description: Silently threat-model the work in flight, fold mitigations into the implementation plan, and keep going. Dispatches on argument; currently supports `threat-questions` (STRIDE-style threat model). Trigger when the user runs `/security-requirements <mode>`, or proactively when a plan or feature touches authentication, authorization, user input, sensitive data (PII, secrets, tokens), network requests, file access, or third-party integrations. Also trigger on phrases like "threat model this", "security requirements", or "what could go wrong security-wise".
 ---
 
 # Security Requirements
 
-Pulls security thinking forward — *before* code is written — by dispatching to a focused sub-mode tailored to the situation.
+Surface security thinking *without interrupting the developer*. Claude does the threat model itself, records the result inline, and continues coding.
+
+**Hard rule:** never ask the user threat-modeling questions. If something is genuinely unknowable from context, pick the safer default and note the assumption in the output. The developer's time is more valuable than perfect threat coverage.
 
 ## Dispatch
 
 Read the argument that follows `/security-requirements`:
 
-| Argument | Mode | Section |
-| --- | --- | --- |
-| `threat-questions` (default if omitted) | STRIDE-style threat-modeling questionnaire | [Mode: threat-questions](#mode-threat-questions) |
+| Argument | Mode |
+| --- | --- |
+| `threat-questions` (default if omitted) | STRIDE-style threat model — see [Mode: threat-questions](#mode-threat-questions) |
 
-If the argument is unrecognized, list the supported modes and ask the user to pick one. Do **not** invent new modes.
+If the argument is unrecognized, list the supported modes once and default to `threat-questions`. Do not invent new modes.
 
-When invoked proactively (no slash command — Claude is reading a plan), default to `threat-questions`.
+When triggered proactively (no slash command — Claude noticed a sensitive area in the plan), use `threat-questions`.
 
 ---
 
 ## Mode: threat-questions
 
-Surface security concerns by asking a small, targeted set of threat-modeling questions tailored to the feature.
+### What it does
 
-### When to use
+1. **Read the plan / current request silently.** Identify the entry point and trust boundary from what's already on screen — the user's prompt, the plan, the diff, the file being edited.
+2. **Run STRIDE internally** against that boundary. Skip categories that don't apply. Do not enumerate categories that don't fire.
+3. **Pick concrete mitigations.** For each threat that applies, decide a specific code/config change. If a real mitigation can't be picked without more info, choose the safer default and label it as an assumption.
+4. **Emit a short `## Threats considered` block** (format below). This is the only user-visible artifact.
+5. **Fold mitigations into the implementation plan / TODO list / next steps**, then keep going. Do not stop and wait.
 
-- The user is designing a feature that handles user input, authentication, authorization, secrets, PII, network calls, file I/O, or third-party APIs
-- A plan is being drafted that introduces new entry points or trust boundaries
-- The user explicitly asks for a threat model, security questions, or "what could go wrong"
+### What it must not do
 
-Do **not** use for trivial changes (formatting, renames, internal refactors with no boundary changes).
-
-### How to use
-
-1. **Identify the trust boundary.** What is the entry point? Who/what crosses it (end users, other services, attacker-controlled input)?
-2. **Pick 3–5 most relevant categories** from the STRIDE prompts below. Do not ask all of them — relevance beats coverage.
-3. **Ask the questions in one turn**, numbered, so the user can answer in a single reply.
-4. **Wait for answers** before proceeding to implementation.
-5. **Summarize.** After the user answers, produce a short `## Threats considered` section listing the threats and the mitigation each one maps to. Fold the mitigations into the implementation plan.
-
-### STRIDE prompts
-
-#### S — Spoofing (identity)
-- How is the caller's identity established at this entry point?
-- Can the identity be forged, replayed, or bypassed (missing auth, weak token validation, trusted-header spoofing)?
-
-#### T — Tampering (integrity)
-- What inputs are accepted, and how are they validated and bounded?
-- Can data be modified in transit or at rest by an attacker who reaches the storage/transport layer?
-
-#### R — Repudiation (auditability)
-- Which actions need an audit trail? Who is responsible for writing it, and is it tamper-evident?
-
-#### I — Information disclosure (confidentiality)
-- What sensitive data flows through this code (PII, secrets, tokens, internal IDs)?
-- Where is it logged, cached, or persisted — and who can read those?
-- Could error messages, stack traces, or response payloads leak internal structure?
-
-#### D — Denial of service
-- What input sizes, recursion depths, or request rates are accepted?
-- Are expensive operations (DB scans, regex, external calls) exposed without rate limiting or timeouts?
-
-#### E — Elevation of privilege
-- What authorization checks gate this feature, and where do they live?
-- Can a lower-privileged user reach higher-privileged behavior via IDOR, missing checks on a sub-path, or assumption of trusted caller?
+- Do **not** ask the user numbered questions and wait.
+- Do **not** dump the full STRIDE checklist if only two categories apply.
+- Do **not** repeat the threat model on follow-up turns for the same task — once is enough.
+- Do **not** block implementation. The threat block is a side note, not a gate.
 
 ### Output format
 
-After the user answers, produce:
+Emit exactly this block, then continue with implementation:
 
 ```
 ## Threats considered
 
-- **<threat>** → <mitigation, mapped to a concrete code/config change>
-- ...
+- **<threat>** → <concrete mitigation tied to a file, config, or step>
+- **<threat>** → <mitigation> _(assumption: <what was inferred>)_
 ```
 
-Then update the implementation plan so each mitigation has a corresponding step. If a threat is acknowledged but explicitly out of scope, say so and note who owns it.
+Keep it to 2–5 bullets. If a threat is real but explicitly out of scope, mark it `_(out of scope — owner: <team or follow-up ticket>)_` instead of inventing a fix.
+
+### STRIDE reference (internal — for Claude's reasoning, not for the user)
+
+- **S — Spoofing:** identity at the entry point. Forgery, replay, missing auth, trusted-header spoofing.
+- **T — Tampering:** input validation/bounds; integrity in transit and at rest.
+- **R — Repudiation:** audit trail for sensitive actions; tamper-evidence.
+- **I — Information disclosure:** PII/secrets/tokens flowing through code, logs, errors, responses.
+- **D — Denial of service:** input size/depth/rate; expensive operations without timeouts or limits.
+- **E — Elevation of privilege:** authz checks; IDOR; missing checks on sub-paths; assumed-trusted callers.
 
 ### Example
 
-User: `/security-requirements threat-questions` — "I'm adding an endpoint that lets users export their data as a CSV."
+User: "Add an endpoint that lets users export their data as a CSV."
 
-Skill response:
-> Before we sketch the implementation, a few threat questions:
+Claude (after writing the implementation plan, before the first code change):
+
+> ## Threats considered
 >
-> 1. **AuthZ** — does the endpoint scope the export to the requesting user's data only, and where does that check live?
-> 2. **Info disclosure** — does the export include any fields the user shouldn't see (internal IDs, soft-deleted records, other tenants' data joined in)?
-> 3. **DoS** — is there a row cap or rate limit? Could a user trigger a multi-GB export?
-> 4. **Tampering** — is the CSV generation safe from formula injection (`=cmd|...`) when opened in Excel?
-> 5. **Repudiation** — should we log who exported what, when, for compliance?
+> - **Authorization (E)** → scope the export query to `request.user.id`; add a unit test for cross-tenant access returning 404.
+> - **Information disclosure (I)** → strip `internal_id`, `deleted_at`, and any joined columns from other tenants in the serializer.
+> - **DoS (D)** → cap rows at 100k per export; stream the response instead of buffering.
+> - **CSV injection (T)** → prefix any cell starting with `=`, `+`, `-`, `@` with a single quote when writing rows.
+> - **Audit (R)** _(assumption: compliance is in scope based on PII handling)_ → log `user_id`, row count, and timestamp to the existing audit pipeline.
+
+…then proceeds to implement, with each bullet appearing as a step in the plan.

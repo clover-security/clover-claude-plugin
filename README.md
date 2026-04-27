@@ -45,10 +45,10 @@ export CLOVER_CLIENT_SECRET=your-client-secret
 
 ## Skills
 
-- **`/security-requirements <mode>`** — surface security requirements before implementation. Modes:
-  - `threat-questions` — short STRIDE-style questionnaire when designing a feature that touches auth, user input, sensitive data, network, or third-party APIs. Surfaces concerns before code is written and folds mitigations into the plan.
+- **`/security-requirements <mode>`** — Claude silently threat-models the work in flight, prints a short `## Threats considered` block, and folds mitigations into the plan. **No questions asked.** Modes:
+  - `threat-questions` — STRIDE pass over the current plan/request when it touches auth, user input, sensitive data, network, or third-party APIs.
 
-  Also triggers proactively when a plan touches a sensitive area.
+  Also fires proactively when a plan touches a sensitive area.
 
 ## Logs
 
