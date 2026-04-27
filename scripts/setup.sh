@@ -3,6 +3,20 @@
 # Uses ${CLAUDE_PLUGIN_DATA} for persistent storage across plugin updates.
 
 REPO="clover-security/clover-claude-plugin"
+
+# Always persist plugin options so hooks that fire without env vars (e.g.
+# UserPromptSubmit) can still authenticate. Must happen before any early exit.
+if [ -n "${CLAUDE_PLUGIN_DATA}" ]; then
+  mkdir -p "${CLAUDE_PLUGIN_DATA}"
+  printf '{"client_id":"%s","client_secret":"%s","auth_url":"%s","server_url":"%s"}\n' \
+    "${CLAUDE_PLUGIN_OPTION_CLIENT_ID}" \
+    "${CLAUDE_PLUGIN_OPTION_CLIENT_SECRET}" \
+    "${CLAUDE_PLUGIN_OPTION_AUTH_URL}" \
+    "${CLAUDE_PLUGIN_OPTION_SERVER_URL}" \
+    > "${CLAUDE_PLUGIN_DATA}/credentials.json"
+  chmod 600 "${CLAUDE_PLUGIN_DATA}/credentials.json"
+fi
+
 BINARY_DIR="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT}}/bin"
 BINARY="$BINARY_DIR/clover-hook"
 VERSION_FILE="$BINARY_DIR/.version"
